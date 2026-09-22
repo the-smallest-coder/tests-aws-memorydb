@@ -1,0 +1,1211 @@
+from __future__ import annotations
+
+import argparse
+import base64
+import csv
+import html
+import io
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime, timezone
+
+import boto3
+
+from report_generator import run_uploaded_report
+
+
+# The full CloudWatch Statistic enum (5 members, no 6th exists) -- SampleCount
+# makes duplicated percentile columns self-identifying: SampleCount == 1
+# means the ExtendedStatistics value for that datapoint equals the raw value
+# by construction, not a coincidence. See PLAN_2.md WP2 change 3.
+STATISTICS = ["SampleCount", "Average", "Sum", "Minimum", "Maximum"]
+# Requested for every discovered metric, not a curated subset (D8): in one
+# get_metric_statistics call, percentiles cost rows, not API calls. p99 is
+# the one this plan's summary fields actually consume (server_request_latency_us).
+DEFAULT_EXTENDED_STATISTICS = ["p99"]
+CLIENT_LATENCY_PERCENTILES = ["p50", "p99", "p99.9"]
+LOG_EXPORT_PART_SIZE = 6 * 1024 * 1024
+
+# WP2: this list no longer drives what gets fetched (discovery does, via
+# list_metrics with no metric_names filter) -- it's now half of what
+# "complete" means: names that must be present regardless of topology. See
+# CORE_ELASTICACHE_CONTRACT_METRICS and conditional_elasticache_metric_contract().
+REQUIRED_ELASTICACHE_METRICS = [
+    "CacheHitRate",
+    "CacheHits",
+    "CacheMisses",
+    "CPUUtilization",
+    "CurrConnections",
+    "CurrItems",
+    "DatabaseCapacityUsageCountedForEvictPercentage",
+    "DatabaseCapacityUsagePercentage",
+    "DatabaseMemoryUsageCountedForEvictPercentage",
+    "DatabaseMemoryUsagePercentage",
+    "EngineCPUUtilization",
+    "Evictions",
+    "FreeableMemory",
+    "GetTypeCmds",
+    "GetTypeCmdsLatency",
+    "MemoryFragmentationRatio",
+    "NetworkBandwidthInAllowanceExceeded",
+    "NetworkBandwidthOutAllowanceExceeded",
+    "NetworkBytesIn",
+    "NetworkBytesOut",
+    "NetworkConntrackAllowanceExceeded",
+    "NetworkPacketsPerSecondAllowanceExceeded",
+    "NewConnections",
+    "SetTypeCmds",
+    "SetTypeCmdsLatency",
+    "StringBasedCmds",
+    "StringBasedCmdsLatency",
+    "SwapUsage",
+]
+
+REQUIRED_ECS_METRICS = [
+    "CPUUtilization",
+    "MemoryUtilization",
+    "RunningTaskCount",
+    "TaskCount",
+    "TaskCpuUtilization",
+    "TaskMemoryUtilization",
+    "CpuUtilized",
+    "CpuReserved",
+    "MemoryUtilized",
+    "NetworkRxBytes",
+    "NetworkTxBytes",
+    "ContainerCpuUtilization",
+    "ContainerMemoryUtilization",
+    "ContainerNetworkRxBytes",
+    "ContainerNetworkTxBytes",
+]
+
+ECS_CLIENT_LATENCY_METRIC = {
+    "namespace": "ElastiCache/LoadGenerator",
+    "metric_name": "ClientLatency",
+    "dimensions": ("ClusterName", "ServiceName", "TaskId"),
+    "stats": CLIENT_LATENCY_PERCENTILES,
+    "unit": "Milliseconds",
+}
+
+REPORT_CONTRACT_METRICS = [
+    "CacheHits",
+    "CacheMisses",
+    "CurrConnections",
+    "CurrItems",
+    "DatabaseCapacityUsageCountedForEvictPercentage",
+    "DatabaseMemoryUsageCountedForEvictPercentage",
+    "EngineCPUUtilization",
+    "Evictions",
+    "FreeableMemory",
+    "GetTypeCmdsLatency",
+    "SetTypeCmdsLatency",
+    "StringBasedCmdsLatency",
+    # WP2: made available by discovery; confirmed published for valkey (the
+    # tested engine) before being added here -- redis is unconfirmed on the
+    # available runs, but the contract is per-run (D8), so an unconfirmed
+    # engine just surfaces as `missing`, not a crash.
+    "TrafficManagementActive",
+    "ErrorCount",
+    "SuccessfulReadRequestLatency",
+    "SuccessfulWriteRequestLatency",
+]
+
+# D8: the completeness contract is conditional on topology, not a fixed list.
+# This is the part that never varies; conditional_elasticache_metric_contract()
+# adds burstable-credit and replication names only when the topology has them.
+CORE_ELASTICACHE_CONTRACT_METRICS = sorted(set(REQUIRED_ELASTICACHE_METRICS) | set(REPORT_CONTRACT_METRICS))
+
+BURSTABLE_NODE_TYPE_PREFIXES = ("cache.t2.", "cache.t3.", "cache.t4g.")
+
+
+class _LazyBoto3Client:
+    def __init__(self, service_name: str):
+        self.service_name = service_name
+        self.client = None
+
+    def __getattr__(self, name: str):
+        if self.client is None:
+            self.client = boto3.client(self.service_name)
+        return getattr(self.client, name)
+
+
+cloudwatch = _LazyBoto3Client("cloudwatch")
+logs = _LazyBoto3Client("logs")
+s3 = _LazyBoto3Client("s3")
+elasticache = _LazyBoto3Client("elasticache")
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _dimensions_to_str(dimensions: list[dict[str, str]]) -> str:
+    return ";".join(
+        f"{name}={value}" for name, value in sorted((d["Name"], d["Value"]) for d in dimensions)
+    )
+
+
+def _read_s3_text(bucket: str, key: str) -> str:
+    response = s3.get_object(Bucket=bucket, Key=key)
+    return response["Body"].read().decode("utf-8", "replace")
+
+
+def _put_json(bucket: str, key: str, payload: dict) -> None:
+    s3.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=json.dumps(payload, indent=2, default=str).encode("utf-8"),
+        ContentType="application/json",
+    )
+
+
+def _safe_s3_key_part(value: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._=-]+", "_", value.strip())
+    return safe or "_"
+
+
+def _log_stream_key(key_prefix: str, stream_name: str) -> str:
+    parts = [_safe_s3_key_part(part) for part in stream_name.split("/") if part]
+    filename = "/".join(parts) if parts else _safe_s3_key_part(stream_name)
+    return f"{key_prefix.rstrip('/')}/{filename}.txt"
+
+
+def _list_log_stream_names(log_group: str) -> list[str]:
+    streams = []
+    token = None
+    while True:
+        params = {
+            "logGroupName": log_group,
+            "orderBy": "LogStreamName",
+        }
+        if token:
+            params["nextToken"] = token
+
+        response = logs.describe_log_streams(**params)
+        streams.extend(stream["logStreamName"] for stream in response.get("logStreams", []))
+        token = response.get("nextToken")
+        if not token:
+            break
+    return sorted(dict.fromkeys(streams))
+
+
+def _fallback_member_clusters(replication_group_id: str) -> list[str]:
+    cluster_mode = os.environ.get("CLUSTER_MODE", "false").strip().lower() == "true"
+    if cluster_mode:
+        node_groups = max(_env_int("NUM_NODE_GROUPS", 1), 1)
+        replicas = max(_env_int("REPLICAS_PER_NODE_GROUP", 0), 0)
+        return [
+            f"{replication_group_id}-{node_group:04d}-{replica:03d}"
+            for node_group in range(1, node_groups + 1)
+            for replica in range(1, replicas + 2)
+        ]
+
+    num_nodes = max(_env_int("NUM_CACHE_NODES", 1), 1)
+    return [f"{replication_group_id}-{node:03d}" for node in range(1, num_nodes + 1)]
+
+
+def _list_metrics(namespace: str, filter_dimensions=None, metric_name_filter=None) -> list[dict]:
+    metrics = []
+    token = None
+    while True:
+        params = {"Namespace": namespace}
+        if filter_dimensions:
+            params["Dimensions"] = filter_dimensions
+        if token:
+            params["NextToken"] = token
+
+        response = cloudwatch.list_metrics(**params)
+        for metric in response.get("Metrics", []):
+            metric_name = metric.get("MetricName")
+            if not metric_name:
+                continue
+            if metric_name_filter and metric_name not in metric_name_filter:
+                continue
+            metrics.append({"MetricName": metric_name, "Dimensions": metric.get("Dimensions", [])})
+
+        token = response.get("NextToken")
+        if not token:
+            break
+    return metrics
+
+
+def _metric_source_stats(source: dict) -> tuple[list[str], list[str]]:
+    # "in"/indexing, not `.get(...) or default`: a source that explicitly
+    # asks for statistics: [] (ClientLatency -- percentiles only, no regular
+    # stats) means none, not "not specified" -- `or` can't tell an explicit
+    # empty list from an absent key, and silently replacing [] with the
+    # 5-stat default defeats the exclusion.
+    statistics = source["statistics"] if "statistics" in source else STATISTICS
+    extended_statistics = source["extended_statistics"] if "extended_statistics" in source else DEFAULT_EXTENDED_STATISTICS
+    return list(statistics), list(extended_statistics)
+
+
+def _is_true(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() == "true"
+
+
+def _as_int_or_none(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def conditional_elasticache_metric_contract(cluster_details: dict | None) -> list[str]:
+    """The ElastiCache metric names this run's topology must publish (D8).
+
+    Not a fixed list: burstable node types add the CPU credit pair, and
+    multi-node / replicated / cluster-mode topologies add replication
+    metrics. A metric absent because this topology doesn't apply to it is
+    not `missing` -- only conditional_elasticache_metric_contract() deciding
+    it doesn't apply, and metric_export.missing_from_discovery then not
+    naming it, makes that distinction instead of a hardcoded metric count.
+    """
+    elasticache = (cluster_details or {}).get("elasticache") or {}
+    contract = set(CORE_ELASTICACHE_CONTRACT_METRICS)
+
+    node_type = str(elasticache.get("node_type") or "")
+    if node_type.startswith(BURSTABLE_NODE_TYPE_PREFIXES):
+        contract |= {"CPUCreditBalance", "CPUCreditUsage"}
+
+    num_cache_nodes = _as_int_or_none(elasticache.get("num_cache_nodes"))
+    replicas_per_node_group = _as_int_or_none(elasticache.get("replicas_per_node_group"))
+    has_replicas = (num_cache_nodes or 0) > 1 or (replicas_per_node_group or 0) > 0
+    if _is_true(elasticache.get("cluster_mode_enabled")) or has_replicas:
+        contract |= {"ReplicationLag", "ReplicationBytes", "MasterLinkHealthStatus"}
+
+    return sorted(contract)
+
+
+def _metric_contract_status(discovered_names, cluster_details: dict | None) -> dict:
+    """Is this run's export complete for its own topology (D8)?
+
+    Only ever evaluated against the run currently being exported, from names
+    list_metrics actually returned during this export -- old runs are never
+    retroactively re-scored against a later contract.
+    """
+    contract = conditional_elasticache_metric_contract(cluster_details)
+    missing = sorted(set(contract) - set(discovered_names))
+    return {"complete": not missing, "missing": missing}
+
+
+def _describe_metric_source(source: dict, discovered_dimensions: list[list[dict[str, str]]]) -> None:
+    label = source.get("label")
+    if not label:
+        return
+    discovered = [_dimensions_to_str(dimensions) for dimensions in discovered_dimensions]
+    print(
+        f"{label}: Namespace={source['namespace']} "
+        f"MetricName={','.join(source.get('metric_names', []))} "
+        f"RequestedDimensions={_dimensions_to_str(source.get('dimensions') or [])} "
+        f"DiscoveredDimensions={discovered or 'none'}"
+    )
+
+
+def _is_validation_exception(exc: Exception) -> bool:
+    """True for CloudWatch's "Statistics or ExtendedStatistics, not both" error.
+
+    The service model declares this restriction but the live API accepts and
+    returns both together (confirmed twice independently, see PLAN_2.md WP2
+    change 4). This detects the documented behavior in case AWS ever
+    enforces it, so the fallback below only fires when actually needed.
+    """
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict) and response.get("Error", {}).get("Code") == "ValidationException":
+        return True
+    return "ValidationException" in str(exc)
+
+
+def _fetch_metric_datapoints(params: dict, statistics: list[str], extended_statistics: list[str]) -> list[dict]:
+    """One combined get_metric_statistics call, with a same-data fallback.
+
+    If AWS starts enforcing the documented Statistics/ExtendedStatistics
+    exclusivity, this call raises ValidationException at the worst possible
+    time -- shutdown, moments before the cluster (and the data) disappears.
+    Losing the whole metric here would be irreversible, so on that specific
+    error this retries as two calls and merges their Datapoints, rather than
+    raising or dropping ExtendedStatistics silently.
+    """
+    try:
+        return cloudwatch.get_metric_statistics(**params).get("Datapoints", [])
+    except Exception as exc:
+        if not (statistics and extended_statistics and _is_validation_exception(exc)):
+            raise
+        stats_only = {k: v for k, v in params.items() if k != "ExtendedStatistics"}
+        ext_only = {k: v for k, v in params.items() if k != "Statistics"}
+        stats_response = cloudwatch.get_metric_statistics(**stats_only)
+        ext_response = cloudwatch.get_metric_statistics(**ext_only)
+        return stats_response.get("Datapoints", []) + ext_response.get("Datapoints", [])
+
+
+def export_metric_sources_to_s3(
+    sources,
+    bucket: str,
+    key: str,
+    start_time: datetime,
+    end_time: datetime,
+    task_metadata: dict[str, dict[str, str]] | None = None,
+) -> tuple[str, dict]:
+    csv_buffer = io.StringIO()
+    writer = csv.writer(csv_buffer)
+    writer.writerow(["Timestamp", "Namespace", "MetricName", "Stat", "Value", "Unit", "Dimensions"])
+
+    metric_map = {}
+    discovered_names: set[str] = set()
+    for source in sources:
+        namespace = source["namespace"]
+        filter_dimensions = source.get("dimensions") or []
+        metric_name_filter = set(source.get("metric_names", [])) if source.get("metric_names") else None
+        optional_metric_names = set(source.get("optional_metric_names", []))
+        statistics, extended_statistics = _metric_source_stats(source)
+        discovered_dimensions = []
+
+        for metric_name in sorted(metric_name_filter or []):
+            if metric_name in optional_metric_names:
+                continue
+            dims_key = tuple(sorted((d["Name"], d["Value"]) for d in filter_dimensions))
+            metric_map[(namespace, metric_name, dims_key)] = (filter_dimensions, statistics, extended_statistics)
+
+        try:
+            metrics = _list_metrics(namespace, filter_dimensions, metric_name_filter)
+        except Exception as exc:
+            print(f"Error listing metrics for {namespace} {filter_dimensions}: {exc}")
+            metrics = []
+
+        for metric in metrics:
+            dimensions = metric.get("Dimensions", [])
+            discovered_dimensions.append(dimensions)
+            discovered_names.add(metric["MetricName"])
+            dims_key = tuple(sorted((d["Name"], d["Value"]) for d in dimensions))
+            metric_map[(namespace, metric["MetricName"], dims_key)] = (dimensions, statistics, extended_statistics)
+
+        _describe_metric_source(source, discovered_dimensions)
+
+    rows_written = 0
+    series_with_data = 0
+    exported_names: set[str] = set()
+    zero_datapoint_names: set[str] = set()
+    errors: list[dict] = []
+    # Diagnostic only (never gates completeness -- see the value_failures
+    # comment on export_elasticache_metrics_to_s3's return below): whether
+    # the cluster's actual read/write activity metrics carry any signal,
+    # tracked from datapoints already being written into the CSV anyway.
+    cache_ops_sum = 0.0
+    curr_items_max = 0.0
+
+    for (namespace, metric_name, _dims_key), (dimensions, statistics, extended_statistics) in metric_map.items():
+        dimensions_str = _dimensions_to_str(dimensions)
+        output_dimensions = list(dimensions)
+        task_id = next((d["Value"] for d in dimensions if d.get("Name") == "TaskId"), None)
+        for name, value in (task_metadata or {}).get(task_id, {}).items():
+            if value and not any(d.get("Name") == name for d in output_dimensions):
+                output_dimensions.append({"Name": name, "Value": str(value)})
+        output_dimensions_str = _dimensions_to_str(output_dimensions)
+
+        params = {
+            "Namespace": namespace,
+            "MetricName": metric_name,
+            "Dimensions": dimensions,
+            "StartTime": start_time,
+            "EndTime": end_time,
+            "Period": 60,
+        }
+        if statistics:
+            params["Statistics"] = statistics
+        if extended_statistics:
+            params["ExtendedStatistics"] = extended_statistics
+
+        try:
+            datapoints = _fetch_metric_datapoints(params, statistics, extended_statistics)
+        except Exception as exc:
+            print(f"Error fetching metric {namespace}/{metric_name} for {dimensions_str}: {exc}")
+            errors.append({"metric": metric_name, "dimensions": dimensions_str, "error": str(exc)})
+            continue
+
+        if not datapoints:
+            # Requested and answered, just empty -- not the same failure mode
+            # as an exception, and not silently indistinguishable from it
+            # either (D8 change 5: this is what metric_export.zero_datapoints
+            # is for).
+            zero_datapoint_names.add(metric_name)
+            continue
+        series_with_data += 1
+        exported_names.add(metric_name)
+
+        for datapoint in sorted(datapoints, key=lambda d: d["Timestamp"]):
+            ts = datapoint["Timestamp"].isoformat()
+            unit = datapoint.get("Unit", "None")
+            for stat in statistics:
+                if stat in datapoint:
+                    writer.writerow([ts, namespace, metric_name, stat, datapoint[stat], unit, output_dimensions_str])
+                    rows_written += 1
+                    if metric_name in ("CacheHits", "CacheMisses") and stat == "Sum":
+                        cache_ops_sum += datapoint[stat]
+                    elif metric_name == "CurrItems" and stat == "Maximum":
+                        curr_items_max = max(curr_items_max, datapoint[stat])
+            for stat in extended_statistics:
+                values = datapoint.get("ExtendedStatistics", {})
+                if stat in values:
+                    writer.writerow([ts, namespace, metric_name, stat, values[stat], unit, output_dimensions_str])
+                    rows_written += 1
+
+    s3.put_object(Bucket=bucket, Key=key, Body=csv_buffer.getvalue(), ContentType="text/csv")
+    print(f"Metrics exported to s3://{bucket}/{key}")
+    stats = {
+        "discovered": sorted(discovered_names),
+        "exported": series_with_data,
+        "exported_names": sorted(exported_names),
+        "zero_datapoints": sorted(zero_datapoint_names),
+        "errors": errors,
+        "rows_written": rows_written,
+        "cache_ops_sum": cache_ops_sum,
+        "curr_items_max": curr_items_max,
+    }
+    return f"s3://{bucket}/{key}", stats
+
+
+def export_elasticache_metrics_to_s3(
+    replication_group_id, bucket, key, start_time, end_time, cluster_details: dict | None = None
+) -> dict:
+    # No metric_names (D8, WP2 change 1): list_metrics returns whatever AWS
+    # actually publishes for these dimensions, so the export adapts itself
+    # instead of going stale the moment AWS ships a new ElastiCache metric.
+    sources = [
+        {
+            "namespace": "AWS/ElastiCache",
+            "dimensions": [{"Name": "ReplicationGroupId", "Value": replication_group_id}],
+        }
+    ]
+
+    member_clusters = []
+    try:
+        response = elasticache.describe_replication_groups(ReplicationGroupId=replication_group_id)
+        for group in response.get("ReplicationGroups", []):
+            member_clusters = group.get("MemberClusters", [])
+    except Exception as exc:
+        print(f"Describe replication group unavailable, using derived node IDs: {exc}")
+
+    member_clusters = list(dict.fromkeys(member_clusters or []))
+    for cluster_id in _fallback_member_clusters(replication_group_id):
+        if cluster_id not in member_clusters:
+            member_clusters.append(cluster_id)
+
+    for cluster_id in member_clusters:
+        sources.append(
+            {
+                "namespace": "AWS/ElastiCache",
+                "dimensions": [{"Name": "CacheClusterId", "Value": cluster_id}],
+            }
+        )
+
+    print(f"ElastiCache metric sources: {[s['dimensions'] for s in sources]}")
+    uri, stats = export_metric_sources_to_s3(sources, bucket, key, start_time, end_time)
+    contract_status = _metric_contract_status(stats["discovered"], cluster_details)
+    # Informational only, like missing_from_discovery above -- never folded
+    # into status["checks"]["metrics"]["complete"] (main() only gates on
+    # rows_written > 0). A hard gate here would reintroduce the exact defect
+    # that check was removed for: a genuinely zero-read or zero-write run
+    # (e.g. the write-only fill workload in TODO.md) would trip it despite a
+    # fully successful export. It exists so a human reviewing
+    # report_status.json can tell "exported fine, cluster just had no real
+    # activity" apart from "exported fine, but the metrics that matter came
+    # back empty" -- rows_written > 0 alone can't distinguish those.
+    value_failures = []
+    if stats["cache_ops_sum"] <= 0:
+        value_failures.append("CacheHits/CacheMisses have no positive Sum datapoints")
+    if stats["curr_items_max"] <= 0:
+        value_failures.append("CurrItems has no positive Maximum datapoints")
+    return {
+        "uri": uri,
+        "discovered": stats["discovered"],
+        "exported": stats["exported"],
+        "exported_names": stats["exported_names"],
+        "zero_datapoints": stats["zero_datapoints"],
+        "missing_from_discovery": contract_status["missing"],
+        "errors": stats["errors"],
+        "rows_written": stats["rows_written"],
+        "value_failures": value_failures,
+        "complete": contract_status["complete"],
+        # Backward-compatible alias: status["checks"]["metrics"]["missing"]
+        # predates this manifest and is the same list under a shorter name.
+        "missing": contract_status["missing"],
+    }
+
+
+def export_ecs_metrics_to_s3(
+    cluster, service, bucket, key, start_time, end_time, task_metadata=None
+) -> str:
+    # No metric_names on the AWS/ECS and ECS/ContainerInsights sources (D8,
+    # WP2 change 1); ClientLatency stays explicit -- it's this exporter's own
+    # EMF metric, not one AWS publishes, so there is nothing to discover.
+    sources = [
+        {
+            "namespace": "AWS/ECS",
+            "dimensions": [{"Name": "ClusterName", "Value": cluster}, {"Name": "ServiceName", "Value": service}],
+        },
+        {
+            "namespace": "ECS/ContainerInsights",
+            "dimensions": [{"Name": "ClusterName", "Value": cluster}],
+        },
+        {
+            "namespace": "ECS/ContainerInsights",
+            "dimensions": [{"Name": "ClusterName", "Value": cluster}, {"Name": "ServiceName", "Value": service}],
+        },
+        {
+            "namespace": ECS_CLIENT_LATENCY_METRIC["namespace"],
+            "dimensions": [{"Name": "ClusterName", "Value": cluster}, {"Name": "ServiceName", "Value": service}],
+            "metric_names": [ECS_CLIENT_LATENCY_METRIC["metric_name"]],
+            "optional_metric_names": [ECS_CLIENT_LATENCY_METRIC["metric_name"]],
+            "statistics": [],
+            "extended_statistics": ECS_CLIENT_LATENCY_METRIC["stats"],
+            "label": "ECS client latency metric discovery",
+        },
+    ]
+    uri, _stats = export_metric_sources_to_s3(
+        sources, bucket, key, start_time, end_time, task_metadata=task_metadata
+    )
+    return uri
+
+
+def export_logs_to_s3(log_group, bucket, key, start_time=None, end_time=None, log_stream_name_prefix: str = "") -> str | None:
+    if not log_group:
+        return None
+
+    buffer = bytearray()
+    upload_id = None
+    parts = []
+    part_number = 1
+
+    def _start_multipart():
+        nonlocal upload_id
+        if upload_id is None:
+            resp = s3.create_multipart_upload(Bucket=bucket, Key=key, ContentType="text/plain")
+            upload_id = resp["UploadId"]
+
+    def _upload_part(data):
+        nonlocal part_number
+        _start_multipart()
+        resp = s3.upload_part(Bucket=bucket, Key=key, UploadId=upload_id, PartNumber=part_number, Body=data)
+        parts.append({"ETag": resp["ETag"], "PartNumber": part_number})
+        part_number += 1
+
+    def _flush(force=False):
+        nonlocal buffer
+        if not buffer:
+            return
+        if len(buffer) < LOG_EXPORT_PART_SIZE and not force:
+            return
+        _upload_part(bytes(buffer))
+        buffer = bytearray()
+
+    buffer.extend(f"LogGroup: {log_group}\n".encode("utf-8", "replace"))
+    next_token = None
+    try:
+        while True:
+            params = {
+                "logGroupName": log_group,
+                "interleaved": True,
+            }
+            if start_time is not None:
+                params["startTime"] = int(start_time.timestamp() * 1000)
+            if end_time is not None:
+                params["endTime"] = int(end_time.timestamp() * 1000)
+            if log_stream_name_prefix:
+                params["logStreamNamePrefix"] = log_stream_name_prefix
+            if next_token:
+                params["nextToken"] = next_token
+
+            response = logs.filter_log_events(**params)
+            for event in response.get("events", []):
+                ts = datetime.fromtimestamp(event["timestamp"] / 1000, tz=timezone.utc).replace(tzinfo=None).isoformat()
+                stream = event.get("logStreamName", "")
+                message = event.get("message", "").rstrip("\n")
+                buffer.extend(f"[{ts}] [{stream}] {message}\n".encode("utf-8", "replace"))
+                if len(buffer) >= LOG_EXPORT_PART_SIZE:
+                    _flush()
+
+            token = response.get("nextToken")
+            if not token or token == next_token:
+                break
+            next_token = token
+    except Exception as exc:
+        print(f"Error fetching logs from {log_group}: {exc}")
+        buffer.extend(f"Error fetching logs from {log_group}: {exc}\n".encode("utf-8", "replace"))
+
+    if upload_id:
+        try:
+            _flush(force=True)
+            s3.complete_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id, MultipartUpload={"Parts": parts})
+        except Exception:
+            s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
+            raise
+    else:
+        s3.put_object(Bucket=bucket, Key=key, Body=bytes(buffer), ContentType="text/plain")
+
+    print(f"Logs exported to s3://{bucket}/{key}")
+    return f"s3://{bucket}/{key}"
+
+
+def _task_metadata_from_container_insights_object(bucket: str, key: str) -> dict[str, dict[str, str]]:
+    """Return TaskId -> CSV dimension enrichment from an exported insights log."""
+    try:
+        content = s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8", "replace")
+    except Exception as exc:
+        print(f"Warning: unable to read Container Insights task metadata: {exc}")
+        return {}
+
+    metadata = {}
+    for line in content.splitlines():
+        message = line.split("] ", 2)[-1] if line.startswith("[") else line
+        try:
+            record = json.loads(message)
+        except json.JSONDecodeError:
+            continue
+        if record.get("Type") != "Task" or not record.get("TaskId"):
+            continue
+        availability_zone = record.get("AvailabilityZone")
+        if availability_zone:
+            metadata[str(record["TaskId"])] = {"AvailabilityZone": str(availability_zone)}
+    return metadata
+
+
+def iter_log_stream_events(log_group, log_stream_name):
+    token = None
+    args = {
+        "logGroupName": log_group,
+        "logStreamName": log_stream_name,
+        "startFromHead": True,
+    }
+
+    while True:
+        if token:
+            args["nextToken"] = token
+
+        response = logs.get_log_events(**args)
+
+        for event in response["events"]:
+            yield event
+
+        next_token = response["nextForwardToken"]
+        if next_token == token:
+            break
+        token = next_token
+
+
+def _log_stream_event_line(event: dict) -> bytes:
+    return json.dumps(event, separators=(",", ":")).encode("utf-8", "replace") + b"\n"
+
+
+def _cloudwatch_event_datetime(event: dict) -> datetime | None:
+    timestamp = event.get("timestamp")
+    if timestamp is None:
+        return None
+    try:
+        return datetime.fromtimestamp(int(timestamp) / 1000, tz=timezone.utc)
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _is_memtier_stream(log_stream_name: str) -> bool:
+    return log_stream_name.split("/", 1)[0] == "memtier"
+
+
+def write_log_stream(log_group: str, log_stream_name: str, write_line) -> dict:
+    result = {
+        "event_count": 0,
+        "first_message_ts": None,
+        "last_message_ts": None,
+    }
+    for event in iter_log_stream_events(log_group, log_stream_name):
+        write_line(_log_stream_event_line(event))
+        result["event_count"] += 1
+        event_ts = _cloudwatch_event_datetime(event)
+        if event_ts is None:
+            continue
+        first_ts = result["first_message_ts"]
+        last_ts = result["last_message_ts"]
+        if first_ts is None or event_ts < first_ts:
+            result["first_message_ts"] = event_ts
+        if last_ts is None or event_ts > last_ts:
+            result["last_message_ts"] = event_ts
+    return result
+
+
+def write_log_stream_to_file(log_group: str, log_stream_name: str, output_path: str) -> dict:
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    with open(output_path, "wb") as output_file:
+        return write_log_stream(log_group, log_stream_name, output_file.write)
+
+
+def _export_log_stream_to_s3_with_status(log_group, log_stream_name, bucket, key) -> dict | None:
+    if not log_group or not log_stream_name:
+        return None
+
+    buffer = bytearray()
+    upload_id = None
+    parts = []
+    part_number = 1
+
+    def _start_multipart():
+        nonlocal upload_id
+        if upload_id is None:
+            resp = s3.create_multipart_upload(Bucket=bucket, Key=key, ContentType="text/plain")
+            upload_id = resp["UploadId"]
+
+    def _upload_part(data):
+        nonlocal part_number
+        _start_multipart()
+        resp = s3.upload_part(Bucket=bucket, Key=key, UploadId=upload_id, PartNumber=part_number, Body=data)
+        parts.append({"ETag": resp["ETag"], "PartNumber": part_number})
+        part_number += 1
+
+    def _flush(force=False):
+        nonlocal buffer
+        if not buffer:
+            return
+        if len(buffer) < LOG_EXPORT_PART_SIZE and not force:
+            return
+        _upload_part(bytes(buffer))
+        buffer = bytearray()
+
+    def _append_line(line: bytes):
+        buffer.extend(line)
+        if len(buffer) >= LOG_EXPORT_PART_SIZE:
+            _flush()
+
+    result = write_log_stream(log_group, log_stream_name, _append_line)
+
+    if upload_id:
+        try:
+            _flush(force=True)
+            s3.complete_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id, MultipartUpload={"Parts": parts})
+        except Exception:
+            s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
+            raise
+    else:
+        s3.put_object(Bucket=bucket, Key=key, Body=bytes(buffer), ContentType="text/plain")
+
+    print(f"Log stream {log_stream_name} exported to s3://{bucket}/{key}")
+    result["artifact"] = f"s3://{bucket}/{key}"
+    return result
+
+
+def export_log_stream_to_s3(log_group, log_stream_name, bucket, key) -> str | None:
+    result = _export_log_stream_to_s3_with_status(log_group, log_stream_name, bucket, key)
+    if result is None:
+        return None
+    return result["artifact"]
+
+
+def _export_log_streams_to_s3(log_group, bucket, key_prefix, streams) -> list[dict]:
+    files = []
+    for stream in streams:
+        key = _log_stream_key(key_prefix, stream)
+        result = _export_log_stream_to_s3_with_status(log_group, stream, bucket, key)
+        artifact = result.get("artifact") if result else None
+        files.append({
+            "stream": stream,
+            "artifact": artifact,
+            "event_count": result.get("event_count", 0) if result else 0,
+            "first_message_ts": result.get("first_message_ts") if result else None,
+            "last_message_ts": result.get("last_message_ts") if result else None,
+        })
+    return files
+
+
+def export_loadgen_logs_to_s3(log_group, bucket, key_prefix) -> dict:
+    key_prefix = key_prefix.rstrip("/")
+    status = {
+        "artifact": f"s3://{bucket}/{key_prefix}/",
+        "files": [],
+        "complete": False,
+    }
+    if not log_group:
+        return status
+
+    streams = _list_log_stream_names(log_group)
+    files = _export_log_streams_to_s3(log_group, bucket, key_prefix, streams)
+    status["files"] = files
+    status["stream_count"] = len(streams)
+    status["complete"] = len(files) == len(streams) and len(streams) > 0
+    first_ts = None
+    last_ts = None
+    for file_status in files:
+        if not _is_memtier_stream(file_status.get("stream", "")):
+            continue
+        file_first_ts = file_status.get("first_message_ts")
+        file_last_ts = file_status.get("last_message_ts")
+        if file_first_ts is not None and (first_ts is None or file_first_ts < first_ts):
+            first_ts = file_first_ts
+        if file_last_ts is not None and (last_ts is None or file_last_ts > last_ts):
+            last_ts = file_last_ts
+    status["first_message_ts"] = first_ts
+    status["last_message_ts"] = last_ts
+    return status
+
+
+def _generate_and_upload_memtier_etl(bucket: str, loadgen_logs_prefix: str, stream_files: list[dict]) -> None:
+    """Run memtier ETL on exported per-stream files and upload sidecar artifacts to S3.
+
+    Uploads per-stream ``{stream}.totals.json`` and a combined
+    ``_memtier.minute.csv`` alongside the raw stream ``.txt`` files so that
+    ``run_uploaded_report()`` can read them via
+    ``_read_uploaded_memtier_artifact_contents()``.
+    """
+    try:
+        from memtier_etl import generate_memtier_dataframes
+    except ImportError as exc:
+        print(f"Warning: memtier_etl not available; skipping ETL artifact generation: {exc}")
+        return
+
+    loadgen_logs_prefix = loadgen_logs_prefix.rstrip("/")
+    memtier_files = [
+        f for f in stream_files
+        if _is_memtier_stream(f.get("stream", "")) and f.get("artifact")
+    ]
+    if not memtier_files:
+        print("No memtier stream files found; skipping ETL artifact generation.")
+        return
+
+    log_pairs: list[tuple[str, str]] = []
+    artifact_base_keys: dict[str, str] = {}
+    for file_info in memtier_files:
+        stream_name = file_info["stream"]
+        artifact_uri = file_info["artifact"]
+        _, key = artifact_uri[5:].split("/", 1)
+        try:
+            content = _read_s3_text(bucket, key)
+        except Exception as exc:
+            print(f"Warning: failed to read stream for ETL '{stream_name}': {exc}")
+            continue
+        log_pairs.append((stream_name, content))
+        artifact_base_keys[stream_name] = key.removesuffix(".txt")
+
+    if not log_pairs:
+        print("Warning: no memtier stream content readable; skipping ETL artifact generation.")
+        return
+
+    print(f"Running memtier ETL on {len(log_pairs)} stream(s).")
+    combined_df, totals_list = generate_memtier_dataframes(log_pairs)
+
+    for payload in totals_list:
+        stream_id = payload["stream_id"]
+        base_key = artifact_base_keys.get(
+            stream_id,
+            f"{loadgen_logs_prefix}/memtier/memtier/{stream_id}",
+        )
+        totals_key = f"{base_key}.totals.json"
+        body = json.dumps(payload, indent=2, default=str).encode("utf-8")
+        s3.put_object(Bucket=bucket, Key=totals_key, Body=body, ContentType="application/json")
+        print(f"ETL totals uploaded: s3://{bucket}/{totals_key}")
+
+    if combined_df.empty:
+        print("Warning: ETL produced empty combined DataFrame; not uploading _memtier.minute.csv.")
+        return
+
+    combined_key = f"{loadgen_logs_prefix}/memtier/memtier/_memtier.minute.csv"
+    csv_buf = io.StringIO()
+    combined_df.to_csv(csv_buf, index=False)
+    s3.put_object(
+        Bucket=bucket,
+        Key=combined_key,
+        Body=csv_buf.getvalue().encode("utf-8"),
+        ContentType="text/csv",
+    )
+    print(f"ETL combined CSV uploaded: s3://{bucket}/{combined_key}")
+
+
+def _ses_config():
+    email = os.environ.get("NOTIFICATION_EMAIL", "").strip()
+    ses_arn = os.environ.get("SES_IDENTITY_ARN", "").strip()
+    if not email or not ses_arn:
+        return None
+    arn_match = re.match(r"arn:aws:ses:([^:]+):[^:]+:identity/(.+)", ses_arn)
+    if not arn_match:
+        print(f"Invalid SES ARN format: {ses_arn}")
+        return None
+    identity = arn_match.group(2)
+    return {
+        "client": boto3.client("ses", region_name=arn_match.group(1)),
+        "source": identity if "@" in identity else f"aws-elasticache-lab@{identity}",
+        "to": email,
+    }
+
+
+def send_report_ready_email(cluster_id: str, report_uri: str, summary_uri: str, bucket: str, prefix: str, timestamp: str):
+    config = _ses_config()
+    if not config:
+        print("Report-ready email disabled.")
+        return None
+
+    cluster_html = html.escape(cluster_id, quote=True)
+    report_html = html.escape(report_uri, quote=True)
+    summary_html = html.escape(summary_uri, quote=True)
+    s3_html = html.escape(f"s3://{bucket}/{prefix}{timestamp}/", quote=True)
+    body_text = (
+        "ElastiCache report ready.\n\n"
+        f"Cluster: {cluster_id}\n"
+        f"Report: {report_uri}\n"
+        f"Summary: {summary_uri}\n"
+    )
+    body_html = f"""\
+<!DOCTYPE html>
+<html><body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;background:#f4f6f9;margin:0;padding:30px;">
+  <table width="600" align="center" style="background:#fff;border-radius:8px;overflow:hidden;border-collapse:collapse;">
+    <tr><td style="background:linear-gradient(135deg,#1e8e3e,#137333);padding:28px 36px;color:#fff;">
+      <div style="font-size:13px;text-transform:uppercase;letter-spacing:1px;opacity:.85;">Performance Test</div>
+      <h1 style="margin:6px 0 0;font-size:24px;">Report Ready</h1>
+    </td></tr>
+    <tr><td style="padding:24px 36px;">
+      <p style="margin:0 0 16px;color:#202124;">Report generation completed for <strong>{cluster_html}</strong>.</p>
+      <p style="font-family:monospace;font-size:13px;color:#202124;">{report_html}</p>
+      <p style="font-family:monospace;font-size:13px;color:#202124;">{summary_html}</p>
+      <p style="font-size:12px;color:#80868b;">Artifacts: {s3_html}</p>
+    </td></tr>
+  </table>
+</body></html>"""
+    response = config["client"].send_email(
+        Source=config["source"],
+        Destination={"ToAddresses": [config["to"]]},
+        Message={
+            "Subject": {"Data": f"[ElastiCache Report Ready] {cluster_id}", "Charset": "UTF-8"},
+            "Body": {
+                "Text": {"Data": body_text, "Charset": "UTF-8"},
+                "Html": {"Data": body_html, "Charset": "UTF-8"},
+            },
+        },
+    )
+    print(f"Report-ready notification sent to {config['to']}, MessageId: {response['MessageId']}")
+    return True
+
+
+_TRACKED_PIP_PACKAGES = ("boto3", "pandas", "plotly")
+
+
+def _parse_pip_freeze(text: str) -> dict[str, str]:
+    """Extract {package: version} for the reporter's pinned dependencies.
+
+    Only the three tracked packages are kept -- `pip freeze` also lists every
+    transitive dependency, which is provenance noise for this purpose (the
+    full text is still preserved as-is in report_status.json.reporter.pip_freeze).
+    """
+    versions: dict[str, str] = {}
+    for line in text.splitlines():
+        name, sep, version = line.strip().partition("==")
+        if sep and name.lower() in _TRACKED_PIP_PACKAGES:
+            versions[name.lower()] = version.strip()
+    return versions
+
+
+def main() -> None:
+    cluster_id = os.environ["CLUSTER_ID"]
+    elasticache_id = os.environ.get("ELASTICACHE_ID", cluster_id)
+    ecs_cluster = os.environ["ECS_CLUSTER"]
+    ecs_service = os.environ["ECS_SERVICE"]
+    bucket = os.environ["S3_BUCKET"]
+    prefix = os.environ.get("S3_PREFIX", "exports/")
+    timestamp = os.environ.get("REPORT_TIMESTAMP") or os.environ.get("RUN_FOLDER")
+    if not timestamp:
+        raise RuntimeError("REPORT_TIMESTAMP or RUN_FOLDER is required")
+
+    metrics_key = f"{prefix}{timestamp}/metrics/{cluster_id}.csv"
+    ecs_metrics_key = f"{prefix}{timestamp}/metrics/{cluster_id}-ecs.csv"
+    loadgen_logs_prefix = f"{prefix}{timestamp}/logs/loadgen"
+    container_insights_key = f"{prefix}{timestamp}/logs/container-insights/{cluster_id}.txt"
+    status_key = f"{prefix}{timestamp}/report_status.json"
+    status = {
+        "cluster_id": cluster_id,
+        "timestamp": timestamp,
+        "complete": False,
+        "checks": {},
+        "artifacts": {
+            "metrics": f"s3://{bucket}/{metrics_key}",
+            "ecs_metrics": f"s3://{bucket}/{ecs_metrics_key}",
+            "loadgen_logs": f"s3://{bucket}/{loadgen_logs_prefix}/",
+        },
+    }
+
+    loadgen_status = export_loadgen_logs_to_s3(
+        os.environ.get("LOADGEN_LOG_GROUP") or os.environ.get("LOG_GROUP"),
+        bucket,
+        loadgen_logs_prefix,
+    )
+    status["checks"]["loadgen_logs"] = loadgen_status
+    _generate_and_upload_memtier_etl(bucket, loadgen_logs_prefix, loadgen_status.get("files", []))
+    start_time = loadgen_status.get("first_message_ts")
+    end_time = loadgen_status.get("last_message_ts")
+    if start_time is None or end_time is None:
+        status["checks"]["metrics"] = {
+            "complete": False,
+            "error": "memtier log message window is unavailable",
+        }
+        _put_json(bucket, status_key, status)
+        raise RuntimeError(
+            "Report data contract incomplete; memtier log message window is unavailable. "
+            f"Details written to s3://{bucket}/{status_key}"
+        )
+
+    # cluster_details.json is already the rich Terraform artifact by this
+    # point (WP0 -- exporter never writes it); read it directly so the
+    # ElastiCache completeness contract can size itself to this run's actual
+    # topology (D8) instead of a hardcoded metric list.
+    cluster_details_key = f"{prefix}{timestamp}/cluster_details.json"
+    try:
+        cluster_details = json.loads(_read_s3_text(bucket, cluster_details_key))
+    except Exception as exc:
+        print(f"Warning: cluster_details.json unavailable for metric contract sizing: {exc}")
+        cluster_details = None
+
+    # Timed narrowly around just this call: rows_written below is this
+    # manifest's count specifically, and the log/ECS exports that follow
+    # have nothing to do with either number (a slow Container Insights log
+    # read must not read as a metric-export slowdown, or vice versa).
+    metric_export_start = time.monotonic()
+    elasticache_manifest = export_elasticache_metrics_to_s3(
+        elasticache_id, bucket, metrics_key, start_time, end_time, cluster_details=cluster_details
+    )
+    metric_export_duration_seconds = time.monotonic() - metric_export_start
+
+    status["metric_export"] = elasticache_manifest
+    # Not a cost figure (D11): the export step's own runtime, recorded so a
+    # growing metric set that stops finishing before the cluster is torn
+    # down becomes visible instead of silently losing data (WP2 exit
+    # condition 5).
+    status["metric_export_timing"] = {
+        "duration_seconds": round(metric_export_duration_seconds, 3),
+        "rows_written": elasticache_manifest.get("rows_written"),
+    }
+    # checks.metrics deliberately does NOT gate on elasticache_manifest's own
+    # "complete" (discovered ⊇ the conditional D8 contract): that check is
+    # topology-wide (~30 names) and meant for human review after the fact
+    # (WP2 exit condition: "missing_from_discovery is empty, OR every name
+    # in it is explained") -- not a runtime gate. A single optional metric
+    # absent for an unrelated reason (ListMetrics propagation lag on a
+    # freshly created cluster, an engine that doesn't publish one of the
+    # four newly-added names) must not abort report generation entirely at
+    # the worst possible time: after the cluster is already gone. The gate
+    # that actually blocks report generation stays narrow and genuinely
+    # about data presence: did the export come back with real rows at all.
+    status["checks"]["metrics"] = {
+        "complete": elasticache_manifest.get("rows_written", 0) > 0,
+        "rows_written": elasticache_manifest.get("rows_written", 0),
+        "errors": elasticache_manifest.get("errors", []),
+    }
+
+    export_logs_to_s3(
+        os.environ.get("CONTAINER_INSIGHTS_LOG_GROUP"),
+        bucket,
+        container_insights_key,
+        start_time,
+        end_time,
+    )
+    task_metadata = _task_metadata_from_container_insights_object(bucket, container_insights_key)
+    export_ecs_metrics_to_s3(
+        ecs_cluster,
+        ecs_service,
+        bucket,
+        ecs_metrics_key,
+        start_time,
+        end_time,
+        task_metadata=task_metadata,
+    )
+
+    export_logs_to_s3(
+        os.environ.get("ELASTICACHE_LOG_GROUP"),
+        bucket,
+        f"{prefix}{timestamp}/logs/elasticache/{cluster_id}.txt",
+        start_time,
+        end_time,
+    )
+    export_logs_to_s3(
+        os.environ.get("LAMBDA_SCHEDULER_LOG_GROUP"),
+        bucket,
+        f"{prefix}{timestamp}/logs/lambda-shutdown-scheduler/{cluster_id}.txt",
+        start_time,
+        end_time,
+    )
+
+    status["complete"] = (
+        status["checks"]["loadgen_logs"].get("complete", False)
+        and status["checks"]["metrics"].get("complete", False)
+    )
+    _put_json(bucket, status_key, status)
+    if not status["complete"]:
+        missing = {
+            name: check
+            for name, check in status["checks"].items()
+            if not check.get("complete", False)
+        }
+        raise RuntimeError(
+            "Report data contract incomplete; refusing to generate an empty report. "
+            f"Details written to s3://{bucket}/{status_key}: {missing}"
+        )
+
+    os.environ["METRICS_CSV"] = f"s3://{bucket}/{metrics_key}"
+    os.environ["ECS_METRICS_CSV"] = f"s3://{bucket}/{ecs_metrics_key}"
+    os.environ["LOGS_PREFIX"] = f"s3://{bucket}/{loadgen_logs_prefix}/"
+    os.environ["CONTAINER_INSIGHTS_LOGS_PREFIX"] = (
+        f"s3://{bucket}/{prefix}{timestamp}/logs/container-insights/"
+    )
+    os.environ["OUTPUT_BUCKET"] = bucket
+    os.environ["OUTPUT_PREFIX"] = prefix
+    os.environ["SUFFIX"] = timestamp
+    os.environ["REPORT_TIMESTAMP"] = timestamp
+
+    # Provenance of the software that actually ran (WP3): pip freeze happens
+    # in reporter.tf's shell script, before this process starts, so it
+    # arrives via env rather than exporter.py having run pip itself.
+    pip_freeze_text = ""
+    pip_freeze_b64 = os.environ.get("PIP_FREEZE_B64", "")
+    if pip_freeze_b64:
+        try:
+            pip_freeze_text = base64.b64decode(pip_freeze_b64).decode("utf-8", "replace")
+        except Exception as exc:
+            print(f"Warning: failed to decode PIP_FREEZE_B64: {exc}")
+    status["reporter"] = {"pip_freeze": pip_freeze_text}
+    os.environ["REPORTER_PACKAGES_JSON"] = json.dumps(_parse_pip_freeze(pip_freeze_text))
+
+    # cluster_details.json is written once, at apply time, by node_details.tf.
+    # The exporter must never write to that key: doing so would overwrite the
+    # rich Terraform artifact with a thin subset of the same fields sourced
+    # from env vars, which is strictly less information. See PLAN_2.md WP0.
+    status["cluster_details"] = run_uploaded_report()
+
+    report_uri = f"s3://{bucket}/{prefix}{timestamp}/results_{timestamp}.html"
+    summary_uri = f"s3://{bucket}/{prefix}{timestamp}/results_{timestamp}.json"
+    status["report"] = report_uri
+    status["summary"] = summary_uri
+    _put_json(bucket, status_key, status)
+    send_report_ready_email(cluster_id, report_uri, summary_uri, bucket, prefix, timestamp)
+
+
+def download_stream_cli(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Download one CloudWatch log stream as raw JSONL events.")
+    parser.add_argument("--log-group", required=True)
+    parser.add_argument("--log-stream", required=True)
+    parser.add_argument("--region", required=True)
+    parser.add_argument("--output", required=True)
+    args = parser.parse_args(argv)
+
+    global logs
+    logs = boto3.client("logs", region_name=args.region)
+    result = write_log_stream_to_file(args.log_group, args.log_stream, args.output)
+    print(f"Wrote {result['event_count']} events from {args.log_stream} to {args.output}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "download-stream":
+        download_stream_cli(sys.argv[2:])
+    else:
+        main()

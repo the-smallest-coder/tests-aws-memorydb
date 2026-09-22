@@ -1,0 +1,383 @@
+# =============================================================================
+# UNPORTED — copied verbatim from tests-aws-elasticache-redis @ HEAD.
+# This file still targets ElastiCache. See PLAN.md, work package WP1.
+# =============================================================================
+
+variable "aws_region" {
+  description = "AWS region for resources"
+  type        = string
+  default     = "us-east-1"
+}
+
+variable "project_name" {
+  description = "Project name for resource naming and tagging"
+  type        = string
+  default     = "elasticache-perf-test"
+}
+
+
+# VPC and Networking
+variable "vpc_id" {
+  description = "ID of existing VPC where ElastiCache will be deployed"
+  type        = string
+}
+
+variable "subnet_ids" {
+  description = "List of subnet IDs for ElastiCache subnet group"
+  type        = list(string)
+}
+
+variable "allowed_cidr_blocks" {
+  description = "CIDR blocks allowed to connect to ElastiCache (defaults to VPC CIDR if empty)"
+  type        = list(string)
+  default     = []
+}
+
+# ElastiCache Configuration
+variable "engine_type" {
+  description = "Cache engine type: redis or valkey"
+  type        = string
+  default     = "redis"
+
+  validation {
+    condition     = contains(["redis", "valkey"], var.engine_type)
+    error_message = "Engine type must be either 'redis' or 'valkey'."
+  }
+}
+
+variable "engine_version" {
+  description = "Engine version (e.g., 7.1 for Redis, 7.2 for Valkey)"
+  type        = string
+  default     = "7.1"
+}
+
+variable "node_type" {
+  description = "ElastiCache node instance type"
+  type        = string
+  default     = "cache.t4g.micro"
+}
+
+variable "enable_price_lookup" {
+  description = <<-EOT
+    Look up this run's live hourly node price via scripts/fetch_elasticache_price.sh
+    (requires bash, aws, and jq on whatever machine runs Terraform). The script itself
+    always exits 0, but Terraform launching it at all can still fail the plan if bash
+    isn't on PATH -- that's a `data` block, so it's re-evaluated on every plan,
+    including `terraform destroy`. Set to false (e.g. `-var enable_price_lookup=false`)
+    as an escape hatch if that ever blocks a destroy; node_hourly_usd_source in
+    cluster_details.json becomes "disabled" instead of erroring.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "cluster_mode_enabled" {
+  description = "Enable Redis/Valkey cluster mode (sharding)"
+  type        = bool
+  default     = false
+}
+
+# Non-cluster mode settings
+variable "num_cache_nodes" {
+  description = "Number of cache nodes for non-cluster mode (including primary)"
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.num_cache_nodes >= 1 && var.num_cache_nodes <= 6
+    error_message = "Number of cache nodes must be between 1 and 6."
+  }
+}
+
+variable "elasticache_availability_zone" {
+  description = "Pin the ElastiCache node to a specific AZ. Empty = let AWS choose. Must be one of the subnet group's AZs."
+  type        = string
+  default     = ""
+}
+
+# Cluster mode settings
+variable "num_node_groups" {
+  description = "Number of node groups (shards) for cluster mode"
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.num_node_groups >= 1 && var.num_node_groups <= 500
+    error_message = "Number of node groups must be between 1 and 500."
+  }
+}
+
+variable "replicas_per_node_group" {
+  description = "Number of replica nodes per shard in cluster mode"
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.replicas_per_node_group >= 0 && var.replicas_per_node_group <= 5
+    error_message = "Replicas per node group must be between 0 and 5."
+  }
+}
+
+# Performance and Configuration
+variable "port" {
+  description = "Port number for ElastiCache"
+  type        = number
+  default     = 6379
+}
+
+variable "parameter_group_family" {
+  description = "Parameter group family (auto-determined from engine and version if not set)"
+  type        = string
+  default     = ""
+}
+
+variable "parameter_group_settings" {
+  description = "Custom parameter group settings as key-value pairs"
+  type        = map(string)
+  default     = {}
+}
+
+variable "snapshot_retention_limit" {
+  description = "Number of days to retain snapshots (0 to disable)"
+  type        = number
+  default     = 0
+}
+
+variable "snapshot_window" {
+  description = "Daily time range for snapshots (HH:MM-HH:MM in UTC)"
+  type        = string
+  default     = "03:00-05:00"
+}
+
+variable "maintenance_window" {
+  description = "Weekly time range for maintenance (ddd:HH:MM-ddd:HH:MM in UTC)"
+  type        = string
+  default     = "sun:05:00-sun:07:00"
+}
+
+variable "automatic_failover_enabled" {
+  description = "Enable automatic failover (requires multi-node setup)"
+  type        = bool
+  default     = false
+}
+
+variable "at_rest_encryption_enabled" {
+  description = "Enable encryption at rest"
+  type        = bool
+  default     = false
+}
+
+variable "transit_encryption_enabled" {
+  description = "Enable encryption in transit (TLS)"
+  type        = bool
+  default     = false
+}
+
+variable "auth_token" {
+  description = "Auth token for Redis AUTH (requires transit_encryption_enabled)"
+  type        = string
+  default     = null
+  sensitive   = true
+}
+
+# CloudWatch
+variable "cloudwatch_log_retention_days" {
+  description = "Number of days to retain CloudWatch logs"
+  type        = number
+  default     = 7
+}
+
+variable "enable_cloudwatch_dashboard" {
+  description = "Create CloudWatch dashboard for monitoring"
+  type        = bool
+  default     = true
+}
+
+# ECS observability
+variable "ecs_container_insights_mode" {
+  description = "ECS Container Insights mode (enhanced required for task-level metrics; may increase cost)"
+  type        = string
+  default     = "enhanced"
+
+  validation {
+    condition     = contains(["enabled", "disabled", "enhanced"], var.ecs_container_insights_mode)
+    error_message = "ecs_container_insights_mode must be one of: enabled, disabled, enhanced."
+  }
+}
+
+# Tags
+variable "tags" {
+  description = "Additional tags for resources"
+  type        = map(string)
+  default     = {}
+}
+
+# Load Generator Configuration
+variable "loadgen_task_count" {
+  description = "Number of ECS tasks running memtier_benchmark (scale factor)"
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.loadgen_task_count >= 1 && var.loadgen_task_count <= 100
+    error_message = "Load generator task count must be between 1 and 100."
+  }
+}
+
+variable "loadgen_image" {
+  description = "memtier_benchmark container image, pinned to a digest so a tag push upstream can't silently change what's under test between two runs."
+  type        = string
+  # Manifest-list (multi-arch) digest, not an arch-specific one: neither this
+  # task definition nor ecs.tf sets a runtime_platform block, so Fargate
+  # picks the platform itself -- an arch-specific pin would lock that choice
+  # silently. Re-fetch when a bump is deliberate:
+  #   TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:redislabs/memtier_benchmark:pull" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+  #   curl -sI -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json" https://registry-1.docker.io/v2/redislabs/memtier_benchmark/manifests/latest | grep -i docker-content-digest
+  # Fetched 2026-09-07 (was redislabs/memtier_benchmark:latest, unpinned).
+  default = "redislabs/memtier_benchmark@sha256:5f15b74f657fd30ee73453af9caa1781de1614f4d934d46feee711dc19b758af"
+}
+
+variable "reporter_image" {
+  description = "Base image for the reporter ECS task, pinned to a digest for the same reason as loadgen_image. Kept in sync with reporter/Dockerfile's FROM line (tests/test_reporter_dependency_pins.py checks it), which isn't actually used by this task definition today but should track the same base."
+  type        = string
+  # Same manifest-list caveat as loadgen_image above. Re-fetch when a bump is
+  # deliberate:
+  #   TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/python:pull" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+  #   curl -sI -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json" https://registry-1.docker.io/v2/library/python/manifests/3.11-slim | grep -i docker-content-digest
+  # Fetched 2026-09-07 (was python:3.11-slim, unpinned).
+  default = "python@sha256:9534e5a8e315485d4061ed659af0fd78a284c015f9b73661b41d6bab25604534"
+}
+
+variable "loadgen_cpu" {
+  description = "Fargate CPU units (256 = 0.25 vCPU, 512 = 0.5 vCPU, 1024 = 1 vCPU)"
+  type        = number
+  default     = 256
+}
+
+variable "loadgen_memory" {
+  description = "Fargate memory in MB (minimum 512)"
+  type        = number
+  default     = 512
+
+  validation {
+    condition     = var.loadgen_memory >= 512
+    error_message = "Fargate requires minimum 512 MB memory."
+  }
+}
+
+variable "loadgen_assign_public_ip" {
+  description = "Assign a public IP to the load generator tasks (workaround for no NAT/egress; not recommended for normal use)"
+  type        = bool
+  default     = false
+}
+
+# memtier_benchmark Configuration
+variable "loadgen_memtier_threads" {
+  description = "Number of threads per memtier task"
+  type        = number
+  default     = 1
+}
+
+variable "loadgen_memtier_clients" {
+  description = "Number of clients per thread"
+  type        = number
+  default     = 1
+}
+
+variable "loadgen_memtier_pipeline" {
+  description = "Pipeline depth (number of concurrent requests)"
+  type        = number
+  default     = 1
+}
+
+variable "loadgen_memtier_data_size" {
+  description = "Data size in bytes for SET operations"
+  type        = number
+  default     = 32
+}
+
+variable "loadgen_memtier_ratio" {
+  description = "SET:GET ratio (e.g., '1:10' means 1 SET for every 10 GETs)"
+  type        = string
+  default     = "1:10"
+}
+
+variable "loadgen_memtier_test_time" {
+  description = "Test duration in seconds (0 = run until ECS stops the task)"
+  type        = number
+  default     = 0
+}
+
+variable "loadgen_memtier_key_pattern" {
+  description = "memtier key access pattern, including mixed patterns such as S:R"
+  type        = string
+  default     = "R:R"
+}
+
+variable "loadgen_memtier_key_maximum" {
+  description = "Maximum key count per load generator task. 0 (default) auto-computes total target keys from writable cache memory (~85% of primary/shard capacity), then divides by loadgen_task_count. Set >0 to use a specific per-task value. Each task still gets a unique key prefix so keyspaces do not overlap."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.loadgen_memtier_key_maximum >= 0 && floor(var.loadgen_memtier_key_maximum) == var.loadgen_memtier_key_maximum
+    error_message = "loadgen_memtier_key_maximum must be a non-negative integer (0 or greater)."
+  }
+}
+
+# Metrics Export Configuration
+variable "metrics_export_s3_bucket" {
+  description = "S3 bucket for exporting metrics and logs (REQUIRED)"
+  type        = string
+
+  validation {
+    condition     = length(var.metrics_export_s3_bucket) > 0
+    error_message = "metrics_export_s3_bucket is required. Create an S3 bucket before running terraform apply."
+  }
+}
+
+variable "metrics_export_s3_prefix" {
+  description = "S3 key prefix for exported data"
+  type        = string
+  default     = "exports/"
+}
+
+variable "test_duration_minutes" {
+  description = "Test duration in minutes before auto-shutdown (default: 60)"
+  type        = number
+  default     = 60
+
+  validation {
+    condition     = var.test_duration_minutes >= 1 && var.test_duration_minutes <= 1440
+    error_message = "Test duration must be between 1 and 1440 minutes (24 hours)."
+  }
+}
+
+# Email Notification Configuration
+variable "notification_email" {
+  description = "Email address for shutdown completion notifications (optional; leave empty to disable)"
+  type        = string
+  default     = ""
+}
+
+variable "notification_ses_identity_arn" {
+  description = "SES verified domain identity ARN for sending notifications (required when notification_email is set)"
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = (var.notification_email == "" && var.notification_ses_identity_arn == "") || (var.notification_email != "" && var.notification_ses_identity_arn != "")
+    error_message = "Both notification_email and notification_ses_identity_arn must be set together, or both left empty."
+  }
+}
+
+variable "run_id_discriminator" {
+  description = "Short per-run uniqueness token appended to cluster_id and run_folder. Lowercase alphanumeric, max 8 chars. Empty string preserves legacy timestamp-only identity."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = can(regex("^[a-z0-9]{0,8}$", var.run_id_discriminator))
+    error_message = "run_id_discriminator must be 0-8 lowercase alphanumeric characters ([a-z0-9])."
+  }
+}

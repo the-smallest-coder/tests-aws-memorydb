@@ -1,0 +1,684 @@
+import json
+import re
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+REPORTER_DIR = str(ROOT / "reporter")
+if REPORTER_DIR not in sys.path:
+    sys.path.insert(0, REPORTER_DIR)
+
+REPORT_CONTRACT_FIXTURES = ROOT / "tests" / "fixtures" / "report_contract"
+BAD_RUN = REPORT_CONTRACT_FIXTURES / "missing_benchmark_run"
+
+
+def card_labels(run_dir: Path) -> set[str]:
+    html = (run_dir / "results_local.html").read_text(encoding="utf-8", errors="replace")
+    return set(re.findall(r"<div class='card-label'>(.*?)</div>", html))
+
+
+def summary(run_dir: Path) -> dict:
+    return json.loads((run_dir / "results_local.json").read_text(encoding="utf-8"))
+
+
+class ReportContractTests(unittest.TestCase):
+    def test_missing_benchmark_fixture_shows_current_failure(self):
+        bad = summary(BAD_RUN)
+
+        self.assertFalse(bad["benchmark"])
+        self.assertFalse((BAD_RUN / "logs").exists())
+        self.assertNotIn("Avg Throughput", card_labels(BAD_RUN))
+
+
+class MemtierParserTests(unittest.TestCase):
+    def test_parser_handles_carriage_return_progress_records(self):
+        try:
+            from parsers import parse_memtier_logs
+        except ModuleNotFoundError as exc:
+            if exc.name == "pandas":
+                self.skipTest("pandas is not installed in this environment")
+            raise
+
+        content = (
+            "[2026-05-01T00:00:10] [memtier/task-a] "
+            "[RUN #1 10%, 1 secs] 100.00 (avg: 100.00) ops/sec, "
+            "1.00 (avg: 1.00) msec latency, 1.00KB/sec (avg: 1.00KB/sec)\r"
+            "[RUN #1 20%, 2 secs] 200.00 (avg: 150.00) ops/sec, "
+            "2.00 (avg: 1.50) msec latency, 2.00KB/sec (avg: 1.50KB/sec)\n"
+        )
+
+        parsed = parse_memtier_logs(content)
+
+        self.assertEqual(len(parsed), 2)
+        self.assertEqual(parsed["Ops/sec"].tolist(), [100.0, 200.0])
+        self.assertEqual(parsed["Latency (ms)"].tolist(), [1.0, 2.0])
+
+    def test_final_totals_keep_last_record_when_timestamp_ties(self):
+        try:
+            from parsers import parse_memtier_final_totals
+        except ModuleNotFoundError as exc:
+            if exc.name == "pandas":
+                self.skipTest("pandas is not installed in this environment")
+            raise
+
+        content = (
+            "[2026-05-01T00:01:00] [memtier/task-a] Totals 100 0 0 1 0.5 2 3 10\n"
+            "[2026-05-01T00:01:00] [memtier/task-a] Totals 200 0 0 2 1.5 3 4 20\n"
+        )
+
+        parsed = parse_memtier_final_totals(content)
+
+        self.assertEqual(parsed["Ops/sec"].tolist(), [200.0])
+        self.assertEqual(parsed["Latency (ms)"].tolist(), [2.0])
+
+    def test_extra_stats_keep_oom_rejections_separate_from_evictions(self):
+        try:
+            from parsers import parse_memtier_extra_stats
+        except ModuleNotFoundError as exc:
+            if exc.name == "pandas":
+                self.skipTest("pandas is not installed in this environment")
+            raise
+
+        stats = parse_memtier_extra_stats(
+            "[2026-05-01T00:00:10] [memtier/task-a] -OOM command not allowed\n"
+            "[2026-05-01T00:00:20] [memtier/task-a] -OOM command not allowed\n"
+        )
+
+        self.assertNotIn("first_eviction_ts", stats)
+        self.assertEqual(str(stats["first_oom_rejection_ts"]), "2026-05-01 00:00:10")
+        self.assertEqual(int(stats["oom_df"]["OOM_events"].sum()), 2)
+
+
+class MinuteArtifactNormalizationTests(unittest.TestCase):
+    """task_count_present is a recent addition to the minute CSV schema
+    (memtier_etl.py). loadgen_analysis.build_loadgen_summary() already
+    treats its absence as "recompute from samples" rather than an error, so
+    normalization must agree: a _memtier.minute.csv from an older reporter
+    image, written before that column existed, must load successfully with
+    the column simply absent -- not raise, and not fill it with NaN (which
+    would satisfy the downstream presence check while feeding it garbage).
+    """
+
+    def test_minute_csv_without_task_count_present_loads_with_column_absent(self):
+        try:
+            from report_generator import _normalize_memtier_minute_artifact
+        except ModuleNotFoundError as exc:
+            if exc.name == "pandas":
+                self.skipTest("pandas is not installed in this environment")
+            raise
+
+        content = (
+            "Timestamp,throughput_sum,latency_weighted_avg,throughput_median,"
+            "throughput_avg,throughput_p10,throughput_p90,throughput_min,"
+            "throughput_max,latency_median,latency_avg,latency_p10,latency_p90,"
+            "latency_min,latency_max\n"
+            "2026-05-01T00:00:00Z,900,9,900,900,900,900,900,900,9,9,9,9,9,9\n"
+        )
+
+        df = _normalize_memtier_minute_artifact(content, "legacy_memtier.minute.csv")
+
+        self.assertNotIn("task_count_present", df.columns)
+        self.assertEqual(df["throughput_sum"].tolist(), [900.0])
+
+    def test_minute_csv_missing_a_required_column_still_raises(self):
+        try:
+            from report_generator import _normalize_memtier_minute_artifact
+        except ModuleNotFoundError as exc:
+            if exc.name == "pandas":
+                self.skipTest("pandas is not installed in this environment")
+            raise
+
+        content = "Timestamp,throughput_sum\n2026-05-01T00:00:00Z,900\n"
+
+        with self.assertRaises(ValueError):
+            _normalize_memtier_minute_artifact(content, "broken_memtier.minute.csv")
+
+
+class MemtierLatencyMaxTests(unittest.TestCase):
+    def test_combined_minutes_keep_progress_latency_max(self):
+        try:
+            from memtier_etl import generate_memtier_dataframes
+        except ModuleNotFoundError as exc:
+            if exc.name == "pandas":
+                self.skipTest("pandas is not installed in this environment")
+            raise
+
+        content = (
+            "[2026-05-01T00:00:00] [memtier/stream-a] "
+            "[RUN #1 1%, 1 secs] 100 (avg: 100) ops/sec, "
+            "1KB/sec (avg: 1KB/sec), 1 (avg: 1) msec latency\n"
+            "[2026-05-01T00:00:10] [memtier/stream-a] "
+            "[RUN #1 2%, 2 secs] 100 (avg: 100) ops/sec, "
+            "1KB/sec (avg: 1KB/sec), 9 (avg: 9) msec latency\n"
+            "[2026-05-01T00:00:20] [memtier/stream-b] "
+            "[RUN #1 1%, 1 secs] 100 (avg: 100) ops/sec, "
+            "1KB/sec (avg: 1KB/sec), 6 (avg: 6) msec latency\n"
+        )
+
+        minutes, _totals = generate_memtier_dataframes([("legacy-log", content)])
+
+        self.assertEqual(minutes["latency_weighted_avg"].tolist(), [5.5])
+        self.assertEqual(minutes["latency_max"].tolist(), [9.0])
+
+    def test_max_latency_outputs_use_latency_max(self):
+        try:
+            import pandas as pd
+
+            from cards import stat_cards_html
+            from summary import build_summary
+        except ModuleNotFoundError as exc:
+            if exc.name == "pandas":
+                self.skipTest("pandas is not installed in this environment")
+            raise
+
+        empty = pd.DataFrame()
+        minutes = pd.DataFrame([
+            {
+                "throughput_sum": 200.0,
+                "latency_weighted_avg": 5.5,
+                "latency_max": 9.0,
+            },
+            {
+                "throughput_sum": 200.0,
+                "latency_weighted_avg": 6.0,
+                "latency_max": 8.0,
+            },
+        ])
+        totals = pd.DataFrame([
+            {
+                "throughput_avg": 100.0,
+                "latency_avg_ms": 5.0,
+                "total_bandwidth_kbs": 10.0,
+            },
+            {
+                "throughput_avg": 100.0,
+                "latency_avg_ms": 6.0,
+                "total_bandwidth_kbs": 11.0,
+            },
+        ])
+
+        report_summary = build_summary(
+            empty,
+            minutes,
+            totals,
+            empty,
+            extra_stats={},
+            config={},
+            cluster_id="cluster-a",
+            time_range="",
+        )
+        html = stat_cards_html(minutes, totals, empty, empty)
+
+        self.assertEqual(report_summary["benchmark"]["max_latency_ms"], 9.0)
+        self.assertIn(
+            "<div class='card-label'>Max Latency</div>"
+            "<div class='card-value' style='color:#e8710a'>9.00",
+            html,
+        )
+
+
+class EvictionSeriesTests(unittest.TestCase):
+    def test_aggregate_evictions_win_over_node_rows(self):
+        try:
+            import pandas as pd
+            from helpers import cloudwatch_eviction_series, first_positive_timestamp
+        except ModuleNotFoundError as exc:
+            if exc.name == "pandas":
+                self.skipTest("pandas is not installed in this environment")
+            raise
+
+        metrics = pd.DataFrame([
+            self._metric("2026-05-01T00:00:00Z", 0, "CacheClusterId=cluster-a"),
+            self._metric("2026-05-01T00:01:00Z", 3, "CacheClusterId=cluster-a"),
+            self._metric("2026-05-01T00:00:00Z", 0, "CacheClusterId=cluster-a;CacheNodeId=0001"),
+            self._metric("2026-05-01T00:01:00Z", 3, "CacheClusterId=cluster-a;CacheNodeId=0001"),
+            self._metric("2026-05-01T00:01:00Z", 4, "CacheClusterId=cluster-a;CacheNodeId=0002"),
+        ])
+        metrics["Timestamp"] = pd.to_datetime(metrics["Timestamp"], utc=True).dt.tz_localize(None)
+
+        selected = cloudwatch_eviction_series(metrics, "cluster-a")
+
+        self.assertEqual(selected["Value"].tolist(), [0, 3])
+        self.assertEqual(str(first_positive_timestamp(selected)), "2026-05-01 00:01:00")
+
+    def test_node_evictions_are_summed_when_aggregate_rows_are_absent(self):
+        try:
+            import pandas as pd
+            from helpers import cloudwatch_eviction_series
+        except ModuleNotFoundError as exc:
+            if exc.name == "pandas":
+                self.skipTest("pandas is not installed in this environment")
+            raise
+
+        metrics = pd.DataFrame([
+            self._metric("2026-05-01T00:00:00Z", 1, "CacheClusterId=cluster-a;CacheNodeId=0001"),
+            self._metric("2026-05-01T00:00:00Z", 2, "CacheClusterId=cluster-a;CacheNodeId=0002"),
+        ])
+        metrics["Timestamp"] = pd.to_datetime(metrics["Timestamp"], utc=True).dt.tz_localize(None)
+
+        selected = cloudwatch_eviction_series(metrics, "cluster-a")
+
+        self.assertEqual(selected["Value"].tolist(), [3])
+
+    def test_replication_group_id_selects_suffixed_non_cluster_node_rows(self):
+        try:
+            import pandas as pd
+            from helpers import cloudwatch_eviction_series
+        except ModuleNotFoundError as exc:
+            if exc.name == "pandas":
+                self.skipTest("pandas is not installed in this environment")
+            raise
+
+        metrics = pd.DataFrame([
+            self._metric("2026-05-01T00:00:00Z", 7, "CacheClusterId=cluster-a-001;CacheNodeId=0001"),
+        ])
+        metrics["Timestamp"] = pd.to_datetime(metrics["Timestamp"], utc=True).dt.tz_localize(None)
+
+        selected = cloudwatch_eviction_series(metrics, "cluster-a")
+
+        self.assertEqual(selected["Value"].tolist(), [7])
+
+    @staticmethod
+    def _metric(timestamp: str, value: int, dimensions: str) -> dict:
+        return {
+            "Timestamp": timestamp,
+            "Namespace": "AWS/ElastiCache",
+            "MetricName": "Evictions",
+            "Stat": "Sum",
+            "Value": value,
+            "Unit": "Count",
+            "Dimensions": dimensions,
+        }
+
+
+class CardRenderingTests(unittest.TestCase):
+    def test_service_cpu_is_labeled_as_time_series_not_cross_task_distribution(self):
+        try:
+            import pandas as pd
+
+            from cards import stat_cards_html
+            from summary import build_summary
+        except ModuleNotFoundError as exc:
+            if exc.name == "pandas":
+                self.skipTest("pandas is not installed in this environment")
+            raise
+
+        ecs = pd.DataFrame([
+            {
+                "Timestamp": pd.Timestamp("2026-05-01T00:00:00"),
+                "Namespace": "AWS/ECS",
+                "MetricName": "CPUUtilization",
+                "Stat": "Average",
+                "Value": 60.0,
+                "Unit": "Percent",
+                "Dimensions": "ClusterName=c;ServiceName=s",
+            },
+            {
+                "Timestamp": pd.Timestamp("2026-05-01T00:01:00"),
+                "Namespace": "AWS/ECS",
+                "MetricName": "CPUUtilization",
+                "Stat": "Average",
+                "Value": 80.0,
+                "Unit": "Percent",
+                "Dimensions": "ClusterName=c;ServiceName=s",
+            },
+        ])
+
+        summary = build_summary(
+            pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), ecs,
+            extra_stats={}, config={}, cluster_id="cluster-a", time_range="",
+        )
+        html = stat_cards_html(
+            pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), ecs,
+        )
+
+        self.assertEqual(summary["ecs"]["service_cpu_time_avg_pct"], 70.0)
+        self.assertEqual(summary["ecs"]["service_cpu_time_peak_pct"], 80.0)
+        self.assertNotIn("avg_cpu_pct", summary["ecs"])
+        self.assertIn("ECS Service CPU — Time Avg", html)
+        self.assertIn("ECS Service CPU — Time Peak", html)
+
+    def test_ecs_mem_peak_reserved_tooltip_uses_average_not_a_mixed_stat_max(self):
+        """Regression: reserved_df in cards.py used to select MemoryReserved
+        rows with no Stat filter. Dead code before WP2 (MemoryReserved was
+        never in REQUIRED_ECS_METRICS, so no rows existed at all); live after
+        WP2 drops the metric_names discovery filter, at which point .max()
+        across all 5 STATISTICS + p99 picks whichever stat has the largest
+        raw value -- typically Sum -- instead of a single task's reservation.
+        """
+        try:
+            import pandas as pd
+
+            from cards import stat_cards_html
+        except ModuleNotFoundError as exc:
+            if exc.name == "pandas":
+                self.skipTest("pandas is not installed in this environment")
+            raise
+
+        def _row(metric_name, stat, value):
+            return {
+                "Timestamp": pd.Timestamp("2026-05-01T00:00:00"),
+                "Namespace": "AWS/ECS",
+                "MetricName": metric_name,
+                "Stat": stat,
+                "Value": value,
+                "Unit": "Megabytes",
+                "Dimensions": "ClusterName=c;ServiceName=s",
+            }
+
+        # 4 tasks x 2048 MB reserved each: Average/Maximum per task is 2048,
+        # but Sum across 4 concurrent tasks in the same minute is 8192.
+        ecs = pd.DataFrame([
+            _row("MemoryUtilized", "Average", 1500.0),
+            _row("MemoryReserved", "Average", 2048.0),
+            _row("MemoryReserved", "Maximum", 2048.0),
+            _row("MemoryReserved", "Sum", 8192.0),
+        ])
+
+        html = stat_cards_html(pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), ecs)
+
+        self.assertIn("Reserved: 2048 MB", html)
+        self.assertNotIn("Reserved: 8192 MB", html)
+
+    def test_within_az_skew_card_renders_without_generator_cpu(self):
+        """generator_cpu_p95_pct comes from Container Insights CPU data;
+        throughput_skew_within_az_max comes from memtier throughput data --
+        independent sources. The skew card must not disappear just because
+        Container Insights CPU is missing for this run.
+        """
+        try:
+            import pandas as pd
+
+            from cards import stat_cards_html
+        except ModuleNotFoundError as exc:
+            if exc.name == "pandas":
+                self.skipTest("pandas is not installed in this environment")
+            raise
+
+        empty = pd.DataFrame()
+        html = stat_cards_html(
+            empty, empty, empty, empty,
+            loadgen={
+                "generator_cpu_p95_pct": None,
+                "throughput_skew_within_az_max": 1.42,
+            },
+        )
+
+        self.assertNotIn("ECS Task CPU p95", html)
+        self.assertIn("Within-AZ Skew", html)
+        self.assertIn(">1.42<", html)
+
+    def test_first_eviction_card_shows_absolute_timestamp(self):
+        try:
+            import pandas as pd
+
+            from cards import stat_cards_html
+        except ModuleNotFoundError as exc:
+            if exc.name == "pandas":
+                self.skipTest("pandas is not installed in this environment")
+            raise
+
+        empty = pd.DataFrame()
+        metrics = pd.DataFrame([
+            EvictionSeriesTests._metric("2026-05-01T00:00:00Z", 0, "CacheClusterId=cluster-a"),
+            EvictionSeriesTests._metric("2026-05-01T01:02:07Z", 1, "CacheClusterId=cluster-a"),
+            EvictionSeriesTests._metric("2026-05-01T00:15:00Z", 9, "CacheClusterId=cluster-b"),
+        ])
+        metrics["Timestamp"] = pd.to_datetime(metrics["Timestamp"], utc=True).dt.tz_localize(None)
+
+        html = stat_cards_html(
+            empty,
+            empty,
+            metrics,
+            empty,
+            extra_stats={"first_message_ts": pd.Timestamp("2026-05-01T00:00:00Z")},
+            config={},
+            cluster_id="cluster-a",
+        )
+
+        self.assertIn("<div class='card-label'>First Eviction</div>", html)
+        self.assertNotIn("1h 02m 07s", html)
+        self.assertIn("Absolute timestamp of the first positive CloudWatch Evictions datapoint", html)
+        self.assertIn("2026-05-01 01:02:07 UTC", html)
+
+
+class LocalGenerateLegacyLogTests(unittest.TestCase):
+    @staticmethod
+    def _write_empty_metrics(run_dir: Path) -> None:
+        metrics_dir = run_dir / "metrics"
+        metrics_dir.mkdir()
+        (metrics_dir / "cluster-a.csv").write_text(
+            "Timestamp,Namespace,MetricName,Stat,Value,Unit,Dimensions\n",
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _write_stale_totals(path: Path) -> None:
+        path.write_text(
+            json.dumps(
+                {
+                    "ops_per_sec": 900,
+                    "avg_latency_ms": 9,
+                    "bandwidth_kbs": 90,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_reader_falls_back_to_legacy_root_loadgen_log(self):
+        try:
+            from report_generator import _read_local_log_contents
+        except ModuleNotFoundError as exc:
+            if exc.name == "pandas":
+                self.skipTest("pandas is not installed in this environment")
+            raise
+
+        with tempfile.TemporaryDirectory() as tmp:
+            logs_dir = Path(tmp) / "logs"
+            logs_dir.mkdir()
+            legacy_log = logs_dir / "cluster-a.txt"
+            legacy_log.write_text("legacy memtier log\n", encoding="utf-8")
+
+            self.assertEqual(
+                _read_local_log_contents(logs_dir, "cluster-a"),
+                [(str(legacy_log), "legacy memtier log\n")],
+            )
+
+    def test_legacy_merged_log_keeps_per_stream_memtier_totals(self):
+        try:
+            from report_generator import _memtier_dfs_from_log_entries, _parse_memtier_log_entries
+        except ModuleNotFoundError as exc:
+            if exc.name == "pandas":
+                self.skipTest("pandas is not installed in this environment")
+            raise
+
+        content = (
+            "[2026-05-01T00:00:00] [memtier/memtier/stream-a] "
+            "[RUN #1 1%, 1 secs] 100 (avg: 100) ops/sec, "
+            "1KB/sec (avg: 1KB/sec), 1 (avg: 1) msec latency\n"
+            "[2026-05-01T00:00:01] [memtier/memtier/stream-b] "
+            "[RUN #1 1%, 1 secs] 200 (avg: 200) ops/sec, "
+            "2KB/sec (avg: 2KB/sec), 2 (avg: 2) msec latency\n"
+            "[2026-05-01T00:01:00] [memtier/memtier/stream-a] "
+            "Totals 100 0 0 1 0.5 2 3 10\n"
+            "[2026-05-01T00:01:01] [memtier/memtier/stream-b] "
+            "Totals 200 0 0 2 1.5 3 4 20\n"
+        )
+        entries = [("/tmp/run/logs/cluster-a.txt", content)]
+
+        _logs_df, extra_stats = _parse_memtier_log_entries(entries)
+        memtier_minute_df, memtier_totals_df = _memtier_dfs_from_log_entries(entries)
+
+        self.assertEqual(str(extra_stats["first_message_ts"]), "2026-05-01 00:00:00")
+        self.assertEqual(memtier_minute_df["throughput_sum"].tolist(), [300.0])
+        self.assertEqual(sorted(memtier_totals_df["source"].tolist()), [
+            "memtier/memtier/stream-a",
+            "memtier/memtier/stream-b",
+        ])
+        self.assertEqual(float(memtier_totals_df["throughput_avg"].sum()), 300.0)
+
+    def test_local_generate_ignores_stale_artifacts_without_source_logs(self):
+        try:
+            from report_generator import run_generate_report
+        except ModuleNotFoundError as exc:
+            if exc.name == "pandas":
+                self.skipTest("pandas is not installed in this environment")
+            raise
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            self._write_empty_metrics(run_dir)
+            stale_dir = run_dir / "logs" / "loadgen" / "memtier" / "memtier"
+            stale_dir.mkdir(parents=True)
+            (stale_dir / "_memtier.minute.csv").write_text(
+                "minute_utc,throughput_sum,latency_weighted_avg,throughput_median,"
+                "throughput_avg,throughput_p10,throughput_p90,throughput_min,"
+                "throughput_max,latency_median,latency_avg,latency_p10,latency_p90,"
+                "latency_min,latency_max\n"
+                "2026-05-01T00:00:00Z,900,9,900,900,900,900,900,900,9,9,9,9,9,9\n",
+                encoding="utf-8",
+            )
+            self._write_stale_totals(stale_dir / "stale.totals.json")
+
+            with self.assertRaises(SystemExit) as raised:
+                run_generate_report(str(run_dir), {})
+            self.assertEqual(raised.exception.code, 2)
+
+    def test_local_generate_ignores_stale_totals_for_incomplete_current_log(self):
+        try:
+            from report_generator import run_generate_report
+        except ModuleNotFoundError as exc:
+            if exc.name == "pandas":
+                self.skipTest("pandas is not installed in this environment")
+            raise
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            self._write_empty_metrics(run_dir)
+            stream_dir = run_dir / "logs" / "loadgen" / "memtier" / "memtier"
+            stream_dir.mkdir(parents=True)
+            (stream_dir / "stream-a.txt").write_text(
+                "[2026-05-01T00:00:00] [memtier/stream-a] "
+                "[RUN #1 1%, 1 secs] 100 (avg: 100) ops/sec, "
+                "1KB/sec (avg: 1KB/sec), 1 (avg: 1) msec latency\n",
+                encoding="utf-8",
+            )
+            self._write_stale_totals(stream_dir / "stream-a.totals.json")
+
+            run_generate_report(str(run_dir), {})
+
+            report_summary = json.loads(
+                (run_dir / "results_local.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(report_summary["benchmark"])
+
+    def test_local_generate_preserves_canonical_report_pair(self):
+        try:
+            from report_generator import run_generate_report
+        except ModuleNotFoundError as exc:
+            if exc.name == "pandas":
+                self.skipTest("pandas is not installed in this environment")
+            raise
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            self._write_empty_metrics(run_dir)
+            stream_dir = run_dir / "logs" / "loadgen" / "memtier" / "memtier"
+            stream_dir.mkdir(parents=True)
+            (stream_dir / "stream-a.txt").write_text(
+                "[2026-05-01T00:00:00] [memtier/stream-a] "
+                "[RUN #1 1%, 1 secs] 100 (avg: 100) ops/sec, "
+                "1KB/sec (avg: 1KB/sec), 1 (avg: 1) msec latency\n",
+                encoding="utf-8",
+            )
+            canonical_json = run_dir / f"results_{run_dir.name}.json"
+            canonical_html = run_dir / f"results_{run_dir.name}.html"
+            canonical_json.write_text("stale canonical json\n", encoding="utf-8")
+            canonical_html.write_text("stale canonical html\n", encoding="utf-8")
+            local_json = run_dir / "results_local.json"
+            local_html = run_dir / "results_local.html"
+            local_json.write_text("stale local json\n", encoding="utf-8")
+            local_html.write_text("stale local html\n", encoding="utf-8")
+
+            run_generate_report(str(run_dir), {})
+
+            self.assertEqual(canonical_json.read_text(encoding="utf-8"), "stale canonical json\n")
+            self.assertEqual(canonical_html.read_text(encoding="utf-8"), "stale canonical html\n")
+            self.assertNotEqual(local_json.read_text(encoding="utf-8"), "stale local json\n")
+            self.assertNotEqual(local_html.read_text(encoding="utf-8"), "stale local html\n")
+
+
+class ReportWindowValidationTests(unittest.TestCase):
+    def test_create_report_requires_memtier_message_window(self):
+        try:
+            import pandas as pd
+            from report_generator import create_report
+        except ModuleNotFoundError as exc:
+            if exc.name == "pandas":
+                self.skipTest("pandas is not installed in this environment")
+            raise
+
+        empty = pd.DataFrame()
+        with self.assertRaisesRegex(ValueError, "missing memtier log message window"):
+            create_report(
+                metrics_df=empty,
+                logs_df=empty,
+                memtier_minute_df=empty,
+                memtier_totals_df=empty,
+                cluster_id="cluster-a",
+                suffix="run-1",
+                ecs_metrics_df=empty,
+                config={},
+                extra_stats={},
+            )
+
+    def test_create_report_rejects_inverted_memtier_window(self):
+        try:
+            import pandas as pd
+            from report_generator import create_report
+        except ModuleNotFoundError as exc:
+            if exc.name == "pandas":
+                self.skipTest("pandas is not installed in this environment")
+            raise
+
+        empty = pd.DataFrame()
+        with self.assertRaisesRegex(ValueError, "invalid memtier log message window"):
+            create_report(
+                metrics_df=empty,
+                logs_df=empty,
+                memtier_minute_df=empty,
+                memtier_totals_df=empty,
+                cluster_id="cluster-a",
+                suffix="run-1",
+                ecs_metrics_df=empty,
+                config={},
+                extra_stats={
+                    "first_message_ts": pd.Timestamp("2026-05-01T00:01:00"),
+                    "last_message_ts": pd.Timestamp("2026-05-01T00:00:59"),
+                },
+            )
+
+    def test_time_range_formats_fractional_seconds_without_padding(self):
+        try:
+            import pandas as pd
+            from report_generator import _format_time_range
+        except ModuleNotFoundError as exc:
+            if exc.name == "pandas":
+                self.skipTest("pandas is not installed in this environment")
+            raise
+
+        text = _format_time_range(
+            pd.Timestamp("2026-02-27T13:00:12.390000"),
+            pd.Timestamp("2026-02-27T14:00:39.089000"),
+        )
+        self.assertEqual(
+            text,
+            "2026-02-27 13:00:12.390 UTC - 2026-02-27 14:00:39.089 UTC",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

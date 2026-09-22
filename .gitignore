@@ -1,0 +1,87 @@
+# Local .terraform directories
+.terraform/
+
+# .tfstate files
+*.tfstate
+*.tfstate.*
+
+# Crash log files
+crash.log
+crash.*.log
+
+# Exclude all .tfvars files, which are likely to contain sensitive data, such as
+# password, private keys, and other secrets. These should not be part of version 
+# control as they are data points which are potentially sensitive and subject 
+# to change depending on the environment.
+*.tfvars
+*.tfvars.json
+
+# Ignore override files as they are usually used to override resources locally and so
+# are not checked in
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Ignore transient lock info files created by terraform apply
+.terraform.tfstate.lock.info
+
+# Include override files you do wish to add to version control using negated pattern
+# !example_override.tf
+
+# Include tfplan files to ignore the plan output of command: terraform plan -out=tfplan
+# example: *tfplan*
+
+# Ignore CLI configuration files
+.terraformrc
+terraform.rc
+
+
+# Ignore packaged Lambda deployment artifacts (zip files) generated during builds.
+lambda/*.zip
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Binary files
+*.pyc
+*.pyo
+*.so
+*.dylib
+*.dll
+*.exe
+*.bin
+*.o
+*.a
+*.out
+*.class
+*.jar
+*.war
+*.ear
+*.lib
+*.obj
+*.pdb
+
+results/*
+reporter/.venv
+reporter/*.txt
+reporter/*.log
+tmp
+.codex-tmp
+.vscode/settings.json
+multirun/batches/*.list
+multirun/logs/
+.tf-plugin-cache/
+TECH_DEBT.md
+PLAN_*.md
+# Divergence from the source project: this repo's plan IS version-controlled.
+# The ElastiCache project gitignores PLAN_*.md; here PLAN.md is the build
+# instruction and must be committed. The pattern above only matches PLAN_*.md,
+# but make the intent explicit so nobody "fixes" it later.
+!PLAN.md
+
+# WP0 output. Committed deliberately — these are the verified AWS facts every
+# hardcoded constant in this repo derives from.
+!docs/verified/
