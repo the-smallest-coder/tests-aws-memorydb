@@ -16,7 +16,6 @@ from report_common import (
     get_nested,
     load_run,
     metric_value,
-    normalize_cluster_mode,
     percent_change,
 )
 from template import render_report
@@ -63,14 +62,19 @@ METRICS: tuple[MetricSpec, ...] = (
     MetricSpec("engine_memory", "Avg Fragmentation", ("memory", "fragmentation_avg"), "x", 3, "lower", "Average memory fragmentation ratio."),
     MetricSpec("engine_memory", "Peak Fragmentation", ("memory", "fragmentation_max"), "x", 2, "lower", "Highest memory fragmentation ratio."),
     MetricSpec("engine_memory", "Peak Swap", ("memory", "swap_max_bytes"), "MB", 1, "lower", "Highest swap consumption observed on the cache node.", normalizer=bytes_to_mb),
-    MetricSpec("cache_latency", "Cache Hit Rate", ("cache_efficiency", "avg_hit_rate_pct"), "%", 2, "higher", "Average CacheHitRate during the report window.", "points"),
+    MetricSpec("cache_latency", "Keyspace Hit Rate", ("cache_efficiency", "avg_hit_rate_pct"), "%", 2, "higher", "Derived from KeyspaceHits/KeyspaceMisses over the report window; MemoryDB publishes no hit-rate metric directly.", "points"),
     MetricSpec("cache_latency", "Total Evictions", ("cache_efficiency", "total_evictions"), "", 0, "lower", "Total key evictions reported by CloudWatch."),
     MetricSpec("cache_latency", "OOM Rejections", ("oom", "rejection_count"), "", 0, "lower", "Total memtier -OOM command rejections."),
     MetricSpec("cache_latency", "Min Freeable Memory", ("cache_efficiency", "min_freeable_memory_mb"), "MB", 1, "higher", "Lowest freeable memory value seen during the run."),
     MetricSpec("cache_latency", "Peak Key Count", ("cache_efficiency", "peak_key_count"), "", 0, "neutral", "Maximum total key count recorded on the cache node."),
-    MetricSpec("cache_latency", "GET Latency", ("latency_server_us", "get_avg"), "us", 3, "lower", "Average server-side GET command latency."),
-    MetricSpec("cache_latency", "SET Latency", ("latency_server_us", "set_avg"), "us", 3, "lower", "Average server-side SET command latency."),
-    MetricSpec("cache_latency", "String Latency", ("latency_server_us", "string_avg"), "us", 3, "lower", "Average server-side string command latency."),
+    # Read and write stay separate rows, and there is deliberately no combined
+    # "server latency" row. MemoryDB commits every write to a multi-AZ
+    # transaction log, so writes sit an order of magnitude above reads by
+    # design; averaging them would describe neither run.
+    MetricSpec("cache_latency", "Read Latency (avg)", ("server_request_latency_us", "read_avg"), "us", 3, "lower", "Average SuccessfulReadRequestLatency. Valkey 7.2+ only."),
+    MetricSpec("cache_latency", "Write Latency (avg)", ("server_request_latency_us", "write_avg"), "us", 3, "lower", "Average SuccessfulWriteRequestLatency. Includes the multi-AZ transaction-log commit, so it is structurally far above read latency."),
+    MetricSpec("cache_latency", "Read Latency (p99)", ("server_request_latency_us", "read_p99"), "us", 3, "lower", "p99 SuccessfulReadRequestLatency."),
+    MetricSpec("cache_latency", "Write Latency (p99)", ("server_request_latency_us", "write_p99"), "us", 3, "lower", "p99 SuccessfulWriteRequestLatency."),
     MetricSpec("cache_latency", "Avg Connections", ("connections", "avg"), "", 1, "neutral", "Average concurrent connections on the cache node."),
     MetricSpec("cache_latency", "Peak Connections", ("connections", "max"), "", 1, "neutral", "Highest concurrent connection count."),
     # Two independent measurements, not a rename pair (see summary.py's
@@ -268,7 +272,8 @@ def build_sections(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def build_run_context(run: RunData) -> dict[str, Any]:
     meta = run.summary.get("meta", {})
-    elasticache = (run.cluster_details or {}).get("elasticache", {})
+    summary_memorydb = run.summary.get("memorydb", {})
+    memorydb = (run.cluster_details or {}).get("memorydb", {})
     memtier = (run.cluster_details or {}).get("memtier", {})
     items: list[dict[str, str]] = []
 
@@ -277,23 +282,33 @@ def build_run_context(run: RunData) -> dict[str, Any]:
             return
         items.append({"label": label, "value": str(value)})
 
+    def first_present(*values: Any) -> Any:
+        # Not `a or b`: 0 replicas per shard is a real value, not a missing one.
+        return next((value for value in values if value not in (None, "")), None)
+
     add("Run folder", run.folder)
     add("Source JSON", str(run.results_path))
     add("Cluster ID", meta.get("cluster_id"))
     add("Time range", meta.get("time_range"))
     add("Report start", meta.get("report_start"))
     add("Report end", meta.get("report_end"))
-    engine = meta.get("engine_type") or elasticache.get("engine")
+    engine = meta.get("engine_type") or memorydb.get("engine")
     add("Engine", engine)
-    add("Engine version", meta.get("engine_version") or elasticache.get("engine_version_configured"))
-    add("Node type", meta.get("node_type") or elasticache.get("node_type"))
-    add("Node memory", _format_gib(meta.get("node_memory_bytes") or elasticache.get("node_memory_bytes")))
+    add("Engine version", meta.get("engine_version") or memorydb.get("engine_version_configured"))
+    add("Node type", meta.get("node_type") or memorydb.get("node_type"))
+    add("Node memory", _format_gib(meta.get("node_memory_bytes") or memorydb.get("node_memory_bytes")))
     add(
         f"{engine.title()} hourly" if engine else "Node hourly",
-        _format_usd_hour(meta.get("node_hourly_usd") or elasticache.get("node_hourly_usd")),
+        _format_usd_hour(meta.get("node_hourly_usd") or memorydb.get("node_hourly_usd")),
     )
-    add("Node count", meta.get("node_count") or elasticache.get("num_cache_nodes"))
-    add("Cluster mode", normalize_cluster_mode(meta.get("cluster_mode")))
+    add("Node count", meta.get("node_count") or memorydb.get("node_count"))
+    add("Shards", first_present(summary_memorydb.get("num_shards"), memorydb.get("num_shards")))
+    add(
+        "Replicas per shard",
+        first_present(summary_memorydb.get("num_replicas_per_shard"), memorydb.get("num_replicas_per_shard")),
+    )
+    add("TLS", memorydb.get("tls_enabled"))
+    add("Data tiering", memorydb.get("data_tiering"))
     add("Task count", memtier.get("task_count") or get_nested(run.summary, ("ecs", "task_count")))
     add("Clients", memtier.get("clients"))
     add("Threads", memtier.get("threads"))
@@ -398,35 +413,47 @@ def collect_takeaways(baseline: RunData, candidate: RunData) -> list[dict[str, s
     )
 
     hit_a, hit_b = number(("cache_efficiency", "avg_hit_rate_pct"))
-    get_lat_a, get_lat_b = number(("latency_server_us", "get_avg"))
-    set_lat_a, set_lat_b = number(("latency_server_us", "set_avg"))
+    read_lat_a, read_lat_b = number(("server_request_latency_us", "read_avg"))
+    write_lat_a, write_lat_b = number(("server_request_latency_us", "write_avg"))
 
-    # Determine tone based on strict improvement/worsening only; equality is neutral.
-    cache_latency_signals = [
-        metric_signal(hit_a, hit_b, higher_is_better=True),
-        metric_signal(get_lat_a, get_lat_b, higher_is_better=False),
-        metric_signal(set_lat_a, set_lat_b, higher_is_better=False),
-    ]
-    cache_latency_signals = [signal for signal in cache_latency_signals if signal != 0]
-
-    if cache_latency_signals and all(signal > 0 for signal in cache_latency_signals):
-        cache_latency_tone = "better"
-    elif cache_latency_signals and all(signal < 0 for signal in cache_latency_signals):
-        cache_latency_tone = "worse"
-    elif cache_latency_signals:
-        cache_latency_tone = "mixed"
-    else:
-        cache_latency_tone = "neutral"
+    def signal_tone(signal: int) -> str:
+        # Strict improvement/worsening only; equality or a missing side is neutral.
+        return {1: "better", -1: "worse"}.get(signal, "neutral")
 
     items.append(
         {
-            "tone": cache_latency_tone,
-            "title": "Cache efficiency and server latency",
+            "tone": signal_tone(metric_signal(hit_a, hit_b, higher_is_better=True)),
+            "title": "Keyspace hit rate",
             "text": (
-                f"Cache hit rate moved {format_number(hit_a or 0, 2)}% -> {format_number(hit_b or 0, 2)}% "
-                f"({diff_points(hit_a, hit_b, 2)}). Server-side GET latency moved "
-                f"{format_number(get_lat_a or 0, 3)} -> {format_number(get_lat_b or 0, 3)} us and SET latency moved "
-                f"{format_number(set_lat_a or 0, 3)} -> {format_number(set_lat_b or 0, 3)} us."
+                f"Keyspace hit rate moved {format_number(hit_a or 0, 2)}% -> {format_number(hit_b or 0, 2)}% "
+                f"({diff_points(hit_a, hit_b, 2)})."
+            ),
+        }
+    )
+
+    # Read and write latency each get their own takeaway and their own
+    # verdict, never one shared tone. On MemoryDB every write pays a multi-AZ
+    # transaction-log commit that reads do not, so a shared verdict would
+    # let a write regression hide behind a read improvement (and vice versa).
+    items.append(
+        {
+            "tone": signal_tone(metric_signal(read_lat_a, read_lat_b, higher_is_better=False)),
+            "title": "Server-side read latency",
+            "text": (
+                f"Average SuccessfulReadRequestLatency moved "
+                f"{format_number(read_lat_a or 0, 3)} -> {format_number(read_lat_b or 0, 3)} us "
+                f"({percent_change(read_lat_a, read_lat_b)})."
+            ),
+        }
+    )
+    items.append(
+        {
+            "tone": signal_tone(metric_signal(write_lat_a, write_lat_b, higher_is_better=False)),
+            "title": "Server-side write latency",
+            "text": (
+                f"Average SuccessfulWriteRequestLatency, which includes the durable multi-AZ commit, moved "
+                f"{format_number(write_lat_a or 0, 3)} -> {format_number(write_lat_b or 0, 3)} us "
+                f"({percent_change(write_lat_a, write_lat_b)})."
             ),
         }
     )
@@ -485,7 +512,7 @@ def collect_takeaways(baseline: RunData, candidate: RunData) -> list[dict[str, s
                 "title": "ECS task constraints detected",
                 "text": (
                     "; ".join(constrained_runs)
-                    + ". ECS task latency may not be representative; this does not invalidate the ElastiCache result."
+                    + ". ECS task latency may not be representative; this does not invalidate the MemoryDB result."
                 ),
             }
         )
@@ -521,8 +548,8 @@ def infer_output_path(baseline: RunData, candidate: RunData, override: str | Non
 def build_compare_payload(baseline: RunData, candidate: RunData) -> dict[str, Any]:
     rows = metric_rows(baseline, candidate)
     return {
-        "title": f"ElastiCache Comparison - {baseline.folder} vs {candidate.folder}",
-        "heading": "ElastiCache Comparison Report",
+        "title": f"MemoryDB Comparison - {baseline.folder} vs {candidate.folder}",
+        "heading": "MemoryDB Comparison Report",
         "subtitle": f"{baseline.folder} vs {candidate.folder}",
         "baseline_name": baseline.folder,
         "candidate_name": candidate.folder,

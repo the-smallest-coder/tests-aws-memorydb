@@ -9,7 +9,7 @@ class LoadgenEmfContractTests(unittest.TestCase):
     def test_loadgen_stdout_publishes_client_latency_emf(self):
         ecs_tf = (ROOT / "ecs.tf").read_text(encoding="utf-8")
 
-        self.assertIn("ElastiCache/LoadGenerator", ecs_tf)
+        self.assertIn("MemoryDB/LoadGenerator", ecs_tf)
         self.assertIn("ClientLatency", ecs_tf)
         self.assertIn("Milliseconds", ecs_tf)
         self.assertIn("StorageResolution", ecs_tf)

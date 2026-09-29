@@ -1,6 +1,11 @@
 # Local .terraform directories
 .terraform/
 
+# Provider lock file. Deliberately not committed: it records exact provider
+# versions, and this test project runs against the newest release every time
+# (see versions.tf). Locally, `terraform init -upgrade` refreshes it.
+.terraform.lock.hcl
+
 # .tfstate files
 *.tfstate
 *.tfstate.*
@@ -76,12 +81,3 @@ multirun/logs/
 .tf-plugin-cache/
 TECH_DEBT.md
 PLAN_*.md
-# Divergence from the source project: this repo's plan IS version-controlled.
-# The ElastiCache project gitignores PLAN_*.md; here PLAN.md is the build
-# instruction and must be committed. The pattern above only matches PLAN_*.md,
-# but make the intent explicit so nobody "fixes" it later.
-!PLAN.md
-
-# WP0 output. Committed deliberately — these are the verified AWS facts every
-# hardcoded constant in this repo derives from.
-!docs/verified/

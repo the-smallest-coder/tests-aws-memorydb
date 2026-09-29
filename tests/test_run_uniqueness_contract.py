@@ -39,7 +39,7 @@ class RunUniquenessContractTests(unittest.TestCase):
         self.assertRegex(main_tf, r'cluster_id\s*=.*run_disc_suffix')
         self.assertRegex(main_tf, r'run_folder\s*=.*run_disc_suffix')
 
-    def test_elasticache_replication_group_has_40_char_precondition(self):
+    def test_memorydb_cluster_has_40_char_precondition(self):
         main_tf = (ROOT / "main.tf").read_text(encoding="utf-8")
         self.assertIn("precondition", main_tf)
         self.assertIn("40-character", main_tf)
@@ -55,28 +55,36 @@ class RunUniquenessContractTests(unittest.TestCase):
         node_details_tf = (ROOT / "node_details.tf").read_text(encoding="utf-8")
         self.assertIn("run_id_discriminator = var.run_id_discriminator", node_details_tf)
 
-    def test_cluster_details_records_pinned_elasticache_availability_zone(self):
+    def test_cluster_details_records_observed_availability_zones(self):
+        """The source project pinned the node AZ so repeat runs of one config
+        stayed comparable, and recorded only an AZ it had actually requested.
+        MemoryDB has no AZ-placement argument at all, so the reproducibility
+        guarantee is replaced by an observability one: placement is read back
+        off the cluster's own shards attribute after the fact.
+
+        The invariant that survives is the same one -- cluster_details.json
+        must never report an AZ that was not the real one. Reading it from the
+        resource makes that true by construction, so what has to be guarded is
+        that nobody reintroduces a *requested* or inferred AZ (e.g. deriving
+        it from var.subnet_ids) as if it were the applied one.
+        """
         node_details_tf = (ROOT / "node_details.tf").read_text(encoding="utf-8")
         variables_tf = (ROOT / "variables.tf").read_text(encoding="utf-8")
         main_tf = (ROOT / "main.tf").read_text(encoding="utf-8")
 
-        self.assertIn('variable "elasticache_availability_zone"', variables_tf)
-        # cluster_details.json must only ever report an AZ that was actually
-        # applied via preferred_cache_cluster_azs, so both must be driven by
-        # the same local rather than independently re-deriving the gate
-        # (cluster_mode_enabled / num_cache_nodes == 1 / var non-empty).
-        self.assertRegex(
-            main_tf,
-            r"elasticache_pinned_az\s*=\s*\(\s*"
-            r"var\.cluster_mode_enabled\s*\|\|\s*var\.elasticache_availability_zone\s*==\s*\"\"\s*"
-            r"\|\|\s*var\.num_cache_nodes\s*!=\s*1",
-        )
+        # Placement is read from the cluster resource, per node.
+        self.assertIn("aws_memorydb_cluster.main.shards", node_details_tf)
         self.assertRegex(
             node_details_tf,
-            r"availability_zone\s*=\s*local\.elasticache_pinned_az",
+            r"availability_zone\s*=\s*node\.availability_zone",
         )
-        self.assertIn("preferred_cache_cluster_azs", main_tf)
-        self.assertIn("[local.elasticache_pinned_az]", main_tf)
+
+        # Nothing requests an AZ, because nothing can.
+        self.assertNotIn("availability_zone", variables_tf)
+        self.assertNotIn("preferred_cache_cluster_azs", main_tf)
+        self.assertNotIn("pinned_az", main_tf)
+
+        # And nothing infers one from the subnets it was handed.
         self.assertNotRegex(
             node_details_tf,
             r"availability_zone\s*=\s*var\.subnet_ids",
@@ -85,15 +93,20 @@ class RunUniquenessContractTests(unittest.TestCase):
     def test_no_data_source_reads_back_the_cluster_shutdown_deletes(self):
         """``data`` blocks are re-evaluated on every plan, including destroy.
         By the time ``terraform destroy`` runs, the shutdown Lambda has
-        already deleted the ElastiCache cluster out-of-band, so any
-        ``data "aws_elasticache_*"`` here would break destroy. The AZ must
-        be supplied by variable, never read back from the live resource.
+        already deleted the MemoryDB cluster out-of-band, so a
+        ``data "aws_memorydb_*"`` block here would fail to read a cluster
+        that no longer exists and break destroy.
+
+        Placement still gets recorded, but through the managed resource's own
+        attributes (aws_memorydb_cluster.main.shards), which come from state
+        at apply time -- not through a fresh read of the live cluster.
         """
         node_details_tf = (ROOT / "node_details.tf").read_text(encoding="utf-8")
         main_tf = (ROOT / "main.tf").read_text(encoding="utf-8")
 
-        self.assertNotIn('data "aws_elasticache_', node_details_tf)
-        self.assertNotIn('data "aws_elasticache_', main_tf)
+        for tf in (node_details_tf, main_tf):
+            self.assertNotIn('data "aws_memorydb_', tf)
+            self.assertNotIn('data "aws_elasticache_', tf)
 
     def test_reporter_scripts_are_scoped_by_cluster_id(self):
         reporter_tf = (ROOT / "reporter.tf").read_text(encoding="utf-8")

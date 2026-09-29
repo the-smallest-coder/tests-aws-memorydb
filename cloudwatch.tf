@@ -1,9 +1,4 @@
-# =============================================================================
-# UNPORTED — copied verbatim from tests-aws-elasticache-redis @ HEAD.
-# This file still targets ElastiCache. See PLAN.md, work package WP1 (dashboard) + WP7.
-# =============================================================================
-
-resource "aws_cloudwatch_dashboard" "elasticache" {
+resource "aws_cloudwatch_dashboard" "memorydb" {
   count = var.enable_cloudwatch_dashboard ? 1 : 0
 
   dashboard_name = "${local.cluster_id}-dashboard"
@@ -16,7 +11,7 @@ resource "aws_cloudwatch_dashboard" "elasticache" {
         width  = 24
         height = 2
         properties = {
-          markdown = "## ElastiCache Performance Dashboard\nEngine: ${var.engine_type} ${var.engine_version} | Instance: ${var.node_type}\nMode: ${var.cluster_mode_enabled ? "Cluster" : "Non-Cluster"} | Nodes: ${var.cluster_mode_enabled ? var.num_node_groups : var.num_cache_nodes}"
+          markdown = "## MemoryDB Performance Dashboard\nEngine: ${var.engine_type} ${var.engine_version} | Instance: ${var.node_type}\nShards: ${var.num_shards} | Replicas per shard: ${var.num_replicas_per_shard} | Nodes billed: ${local.memorydb_node_count}"
         }
       },
 
@@ -26,7 +21,7 @@ resource "aws_cloudwatch_dashboard" "elasticache" {
         width  = 24
         height = 2
         properties = {
-          markdown = "## Load Generator (ECS Tasks)\nEndpoint: ${local.elasticache_endpoint}:${var.port}\nTasks: ${var.loadgen_task_count} | Threads: ${var.loadgen_memtier_threads} | Clients: ${var.loadgen_memtier_clients} | Duration: ${local.memtier_duration_label}"
+          markdown = "## Load Generator (ECS Tasks)\nEndpoint: ${local.memorydb_endpoint}:${var.port}\nTasks: ${var.loadgen_task_count} | Threads: ${var.loadgen_memtier_threads} | Clients: ${var.loadgen_memtier_clients} | Duration: ${local.memtier_duration_label}"
         }
       },
 
@@ -195,13 +190,13 @@ resource "aws_cloudwatch_dashboard" "elasticache" {
         }
       },
 
-      # ElastiCache Network Performance Section Header
+      # MemoryDB Network Performance Section Header
       {
         type   = "text"
         width  = 24
         height = 1
         properties = {
-          markdown = "## ElastiCache Network Performance"
+          markdown = "## MemoryDB Network Performance"
         }
       },
 
@@ -212,7 +207,7 @@ resource "aws_cloudwatch_dashboard" "elasticache" {
         height = 6
         properties = {
           metrics = [
-            ["AWS/ElastiCache", "NetworkBytesIn", { stat = "Sum", id = "m1" }],
+            ["AWS/MemoryDB", "NetworkBytesIn", { stat = "Sum", id = "m1" }],
             [{ expression = "m1/PERIOD(m1)/1024/1024", label = "Ingress (MB/s)", id = "e1" }]
           ]
           view    = "timeSeries"
@@ -225,24 +220,6 @@ resource "aws_cloudwatch_dashboard" "elasticache" {
               label = "MB/s"
             }
           }
-          annotations = {
-            horizontal = [
-              {
-                label = "Instance Network Limit (reference)"
-                value = var.node_type == "cache.t4g.micro" ? 625 : (
-                  var.node_type == "cache.t4g.small" ? 625 : (
-                    var.node_type == "cache.t4g.medium" ? 625 : (
-                      var.node_type == "cache.r7g.large" ? 1562.5 : (
-                        var.node_type == "cache.r7g.xlarge" ? 1562.5 : 0
-                      )
-                    )
-                  )
-                )
-                fill  = "above"
-                color = "#ff7f0e"
-              }
-            ]
-          }
         }
       },
 
@@ -253,7 +230,7 @@ resource "aws_cloudwatch_dashboard" "elasticache" {
         height = 6
         properties = {
           metrics = [
-            ["AWS/ElastiCache", "NetworkBytesOut", { stat = "Sum", id = "m1" }],
+            ["AWS/MemoryDB", "NetworkBytesOut", { stat = "Sum", id = "m1" }],
             [{ expression = "m1/PERIOD(m1)/1024/1024", label = "Egress (MB/s)", id = "e1" }]
           ]
           view    = "timeSeries"
@@ -266,24 +243,6 @@ resource "aws_cloudwatch_dashboard" "elasticache" {
               label = "MB/s"
             }
           }
-          annotations = {
-            horizontal = [
-              {
-                label = "Instance Network Limit (reference)"
-                value = var.node_type == "cache.t4g.micro" ? 625 : (
-                  var.node_type == "cache.t4g.small" ? 625 : (
-                    var.node_type == "cache.t4g.medium" ? 625 : (
-                      var.node_type == "cache.r7g.large" ? 1562.5 : (
-                        var.node_type == "cache.r7g.xlarge" ? 1562.5 : 0
-                      )
-                    )
-                  )
-                )
-                fill  = "above"
-                color = "#ff7f0e"
-              }
-            ]
-          }
         }
       },
 
@@ -294,7 +253,7 @@ resource "aws_cloudwatch_dashboard" "elasticache" {
         height = 6
         properties = {
           metrics = [
-            ["AWS/ElastiCache", "NetworkBytesIn", { stat = "Sum", id = "m1", visible = false }],
+            ["AWS/MemoryDB", "NetworkBytesIn", { stat = "Sum", id = "m1", visible = false }],
             [".", "NetworkBytesOut", { stat = "Sum", id = "m2", visible = false }],
             [{ expression = "m1/PERIOD(m1)*8/1000/1000/1000", label = "Ingress (Gbps)", id = "e1" }],
             [{ expression = "m2/PERIOD(m2)*8/1000/1000/1000", label = "Egress (Gbps)", id = "e2" }]
@@ -310,24 +269,6 @@ resource "aws_cloudwatch_dashboard" "elasticache" {
               min   = 0
             }
           }
-          annotations = {
-            horizontal = [
-              {
-                label = "AWS Network Limit (${var.node_type})"
-                value = var.node_type == "cache.t4g.micro" ? 5 : (
-                  var.node_type == "cache.t4g.small" ? 5 : (
-                    var.node_type == "cache.t4g.medium" ? 5 : (
-                      var.node_type == "cache.r7g.large" ? 12.5 : (
-                        var.node_type == "cache.r7g.xlarge" ? 12.5 : 10
-                      )
-                    )
-                  )
-                )
-                fill  = "above"
-                color = "#d62728"
-              }
-            ]
-          }
         }
       },
 
@@ -337,7 +278,7 @@ resource "aws_cloudwatch_dashboard" "elasticache" {
         width  = 24
         height = 1
         properties = {
-          markdown = "## ElastiCache Performance Metrics"
+          markdown = "## MemoryDB Performance Metrics"
         }
       },
 
@@ -348,7 +289,7 @@ resource "aws_cloudwatch_dashboard" "elasticache" {
         height = 6
         properties = {
           metrics = [
-            ["AWS/ElastiCache", "CPUUtilization", { stat = "Average" }]
+            ["AWS/MemoryDB", "CPUUtilization", { stat = "Average" }]
           ]
           view    = "timeSeries"
           stacked = false
@@ -372,7 +313,7 @@ resource "aws_cloudwatch_dashboard" "elasticache" {
         height = 6
         properties = {
           metrics = [
-            ["AWS/ElastiCache", "DatabaseMemoryUsagePercentage", { stat = "Average" }]
+            ["AWS/MemoryDB", "DatabaseMemoryUsagePercentage", { stat = "Average" }]
           ]
           view    = "timeSeries"
           stacked = false
@@ -396,7 +337,7 @@ resource "aws_cloudwatch_dashboard" "elasticache" {
         height = 6
         properties = {
           metrics = [
-            ["AWS/ElastiCache", "SwapUsage", { stat = "Average" }]
+            ["AWS/MemoryDB", "SwapUsage", { stat = "Average" }]
           ]
           view    = "timeSeries"
           stacked = false
@@ -411,21 +352,21 @@ resource "aws_cloudwatch_dashboard" "elasticache" {
         }
       },
 
-      # Cache Hit Rate
+      # Keyspace Hit Rate
       {
         type   = "metric"
         width  = 12
         height = 6
         properties = {
           metrics = [
-            ["AWS/ElastiCache", "CacheHits", { stat = "Sum", id = "hits", visible = false }],
-            [".", "CacheMisses", { stat = "Sum", id = "misses", visible = false }],
+            ["AWS/MemoryDB", "KeyspaceHits", { stat = "Sum", id = "hits", visible = false }],
+            [".", "KeyspaceMisses", { stat = "Sum", id = "misses", visible = false }],
             [{ expression = "100*(hits/(hits+misses))", label = "Hit Rate %", id = "hitrate" }]
           ]
           view    = "timeSeries"
           stacked = false
           region  = var.aws_region
-          title   = "Cache Hit Rate"
+          title   = "Keyspace Hit Rate"
           period  = 300
           yAxis = {
             left = {
@@ -437,20 +378,20 @@ resource "aws_cloudwatch_dashboard" "elasticache" {
         }
       },
 
-      # Cache Operations (Hits vs Misses)
+      # Keyspace Operations (Hits vs Misses)
       {
         type   = "metric"
         width  = 12
         height = 6
         properties = {
           metrics = [
-            ["AWS/ElastiCache", "CacheHits", { stat = "Sum" }],
-            [".", "CacheMisses", { stat = "Sum" }]
+            ["AWS/MemoryDB", "KeyspaceHits", { stat = "Sum" }],
+            [".", "KeyspaceMisses", { stat = "Sum" }]
           ]
           view    = "timeSeries"
           stacked = false
           region  = var.aws_region
-          title   = "Cache Hits vs Misses"
+          title   = "Keyspace Hits vs Misses"
           period  = 300
         }
       },
@@ -461,7 +402,7 @@ resource "aws_cloudwatch_dashboard" "elasticache" {
         width  = 24
         height = 1
         properties = {
-          markdown = "## ElastiCache Operations and Connections"
+          markdown = "## MemoryDB Operations and Connections"
         }
       },
 
@@ -472,7 +413,7 @@ resource "aws_cloudwatch_dashboard" "elasticache" {
         height = 6
         properties = {
           metrics = [
-            ["AWS/ElastiCache", "CurrConnections", { stat = "Average" }]
+            ["AWS/MemoryDB", "CurrConnections", { stat = "Average" }]
           ]
           view    = "timeSeries"
           stacked = false
@@ -489,7 +430,7 @@ resource "aws_cloudwatch_dashboard" "elasticache" {
         height = 6
         properties = {
           metrics = [
-            ["AWS/ElastiCache", "NewConnections", { stat = "Sum" }]
+            ["AWS/MemoryDB", "NewConnections", { stat = "Sum" }]
           ]
           view    = "timeSeries"
           stacked = false
@@ -506,7 +447,7 @@ resource "aws_cloudwatch_dashboard" "elasticache" {
         height = 6
         properties = {
           metrics = [
-            ["AWS/ElastiCache", "Evictions", { stat = "Sum" }]
+            ["AWS/MemoryDB", "Evictions", { stat = "Sum" }]
           ]
           view    = "timeSeries"
           stacked = false
@@ -523,7 +464,7 @@ resource "aws_cloudwatch_dashboard" "elasticache" {
         height = 6
         properties = {
           metrics = [
-            ["AWS/ElastiCache", "GetTypeCmds", { stat = "Sum" }],
+            ["AWS/MemoryDB", "GetTypeCmds", { stat = "Sum" }],
             [".", "SetTypeCmds", { stat = "Sum" }],
             [".", "HashBasedCmds", { stat = "Sum" }],
             [".", "ListBasedCmds", { stat = "Sum" }],
@@ -545,7 +486,7 @@ resource "aws_cloudwatch_dashboard" "elasticache" {
         height = 6
         properties = {
           metrics = [
-            ["AWS/ElastiCache", "GetTypeCmds", { stat = "Sum", id = "m1", visible = false }],
+            ["AWS/MemoryDB", "GetTypeCmds", { stat = "Sum", id = "m1", visible = false }],
             [".", "SetTypeCmds", { stat = "Sum", id = "m2", visible = false }],
             [".", "HashBasedCmds", { stat = "Sum", id = "m3", visible = false }],
             [".", "ListBasedCmds", { stat = "Sum", id = "m4", visible = false }],
@@ -572,7 +513,7 @@ resource "aws_cloudwatch_dashboard" "elasticache" {
         width  = 24
         height = 1
         properties = {
-          markdown = "## ElastiCache Additional Metrics"
+          markdown = "## MemoryDB Additional Metrics"
         }
       },
 
@@ -583,7 +524,7 @@ resource "aws_cloudwatch_dashboard" "elasticache" {
         height = 6
         properties = {
           metrics = [
-            ["AWS/ElastiCache", "CurrItems", { stat = "Average" }]
+            ["AWS/MemoryDB", "CurrItems", { stat = "Average" }]
           ]
           view    = "timeSeries"
           stacked = false
@@ -600,7 +541,7 @@ resource "aws_cloudwatch_dashboard" "elasticache" {
         height = 6
         properties = {
           metrics = [
-            ["AWS/ElastiCache", "MemoryFragmentationRatio", { stat = "Average" }]
+            ["AWS/MemoryDB", "MemoryFragmentationRatio", { stat = "Average" }]
           ]
           view    = "timeSeries"
           stacked = false
@@ -617,7 +558,7 @@ resource "aws_cloudwatch_dashboard" "elasticache" {
         height = 6
         properties = {
           metrics = [
-            ["AWS/ElastiCache", "ReplicationLag", { stat = "Average" }]
+            ["AWS/MemoryDB", "ReplicationLag", { stat = "Average" }]
           ]
           view    = "timeSeries"
           stacked = false

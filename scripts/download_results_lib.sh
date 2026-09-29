@@ -138,11 +138,10 @@ _current_reporter_state() {
 }
 
 _current_service_state() {
-    local service_json
-    EC_STATUS=$(aws elasticache describe-replication-groups \
-        --replication-group-id "$CLUSTER_ID" \
+    EC_STATUS=$(aws memorydb describe-clusters \
+        --cluster-name "$CLUSTER_ID" \
         --region "$REGION" \
-        --query "ReplicationGroups[0].Status" \
+        --query "Clusters[0].Status" \
         --output text 2>/dev/null) || EC_STATUS=""
 
     service_json=$(aws ecs describe-services \

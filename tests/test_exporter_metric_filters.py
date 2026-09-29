@@ -1,3 +1,4 @@
+import csv
 import importlib.util
 import io
 import sys
@@ -240,7 +241,7 @@ class MetricExportFilterTests(unittest.TestCase):
         self.assertNotIn("Statistics", fake_cloudwatch.request)
         printed = "\n".join(str(call.args[0]) for call in fake_print.call_args_list if call.args)
         self.assertIn("ECS client latency metric discovery", printed)
-        self.assertIn("Namespace=ElastiCache/LoadGenerator", printed)
+        self.assertIn("Namespace=MemoryDB/LoadGenerator", printed)
         self.assertIn("MetricName=ClientLatency", printed)
         self.assertIn("RequestedDimensions=ClusterName=cluster-a;ServiceName=service-a", printed)
         self.assertIn("TaskId=task-a", printed)
@@ -279,8 +280,8 @@ class MetricExportFilterTests(unittest.TestCase):
                     exporter.export_metric_sources_to_s3(
                         [
                             {
-                                "namespace": "AWS/ElastiCache",
-                                "dimensions": [{"Name": "CacheClusterId", "Value": "cluster-a-001"}],
+                                "namespace": "AWS/MemoryDB",
+                                "dimensions": [{"Name": "NodeName", "Value": "cluster-a-001"}],
                                 "metric_names": ["EngineCPUUtilization", "CPUCreditBalance", "CPUCreditUsage"],
                                 "optional_metric_names": ["CPUCreditBalance", "CPUCreditUsage"],
                             }
@@ -299,7 +300,7 @@ class MetricExportFilterTests(unittest.TestCase):
         present = run([
             {
                 "MetricName": "CPUCreditBalance",
-                "Dimensions": [{"Name": "CacheClusterId", "Value": "cluster-a-001"}],
+                "Dimensions": [{"Name": "NodeName", "Value": "cluster-a-001"}],
             }
         ])
 
@@ -317,8 +318,8 @@ class DiscoveryDrivenExportTests(unittest.TestCase):
             def list_metrics(self, **_params):
                 return {
                     "Metrics": [
-                        {"MetricName": "TrafficManagementActive", "Dimensions": [{"Name": "CacheClusterId", "Value": "cluster-a"}]},
-                        {"MetricName": "ErrorCount", "Dimensions": [{"Name": "CacheClusterId", "Value": "cluster-a"}]},
+                        {"MetricName": "TrafficManagementActive", "Dimensions": [{"Name": "NodeName", "Value": "cluster-a"}]},
+                        {"MetricName": "ErrorCount", "Dimensions": [{"Name": "NodeName", "Value": "cluster-a"}]},
                     ]
                 }
 
@@ -336,7 +337,7 @@ class DiscoveryDrivenExportTests(unittest.TestCase):
         exporter.s3 = fake_s3
         with mock.patch("builtins.print"):
             _uri, stats = exporter.export_metric_sources_to_s3(
-                [{"namespace": "AWS/ElastiCache", "dimensions": [{"Name": "CacheClusterId", "Value": "cluster-a"}]}],
+                [{"namespace": "AWS/MemoryDB", "dimensions": [{"Name": "NodeName", "Value": "cluster-a"}]}],
                 "bucket", "metrics.csv",
                 datetime(2026, 8, 10, tzinfo=timezone.utc), datetime(2026, 8, 10, 1, tzinfo=timezone.utc),
             )
@@ -360,7 +361,7 @@ class PercentileFetchTests(unittest.TestCase):
             def list_metrics(self, **_params):
                 return {"Metrics": [{
                     "MetricName": "SuccessfulReadRequestLatency",
-                    "Dimensions": [{"Name": "CacheClusterId", "Value": "cluster-a"}],
+                    "Dimensions": [{"Name": "NodeName", "Value": "cluster-a"}],
                 }]}
 
             def get_metric_statistics(self, **params):
@@ -382,7 +383,7 @@ class PercentileFetchTests(unittest.TestCase):
         exporter.s3 = fake_s3
         with mock.patch("builtins.print"):
             exporter.export_metric_sources_to_s3(
-                [{"namespace": "AWS/ElastiCache", "dimensions": [{"Name": "CacheClusterId", "Value": "cluster-a"}]}],
+                [{"namespace": "AWS/MemoryDB", "dimensions": [{"Name": "NodeName", "Value": "cluster-a"}]}],
                 "bucket", "metrics.csv",
                 datetime(2026, 8, 10, tzinfo=timezone.utc), datetime(2026, 8, 10, 1, tzinfo=timezone.utc),
             )
@@ -402,7 +403,7 @@ class PercentileFetchTests(unittest.TestCase):
             def list_metrics(self, **_params):
                 return {"Metrics": [{
                     "MetricName": "SuccessfulReadRequestLatency",
-                    "Dimensions": [{"Name": "CacheClusterId", "Value": "cluster-a"}],
+                    "Dimensions": [{"Name": "NodeName", "Value": "cluster-a"}],
                 }]}
 
             def get_metric_statistics(self, **params):
@@ -432,7 +433,7 @@ class PercentileFetchTests(unittest.TestCase):
         exporter.s3 = fake_s3
         with mock.patch("builtins.print"):
             exporter.export_metric_sources_to_s3(
-                [{"namespace": "AWS/ElastiCache", "dimensions": [{"Name": "CacheClusterId", "Value": "cluster-a"}]}],
+                [{"namespace": "AWS/MemoryDB", "dimensions": [{"Name": "NodeName", "Value": "cluster-a"}]}],
                 "bucket", "metrics.csv",
                 datetime(2026, 8, 10, tzinfo=timezone.utc), datetime(2026, 8, 10, 1, tzinfo=timezone.utc),
             )
@@ -447,7 +448,7 @@ class PercentileFetchTests(unittest.TestCase):
         class FakeCloudWatch:
             def list_metrics(self, **_params):
                 return {"Metrics": [{
-                    "MetricName": "Evictions", "Dimensions": [{"Name": "CacheClusterId", "Value": "cluster-a"}],
+                    "MetricName": "Evictions", "Dimensions": [{"Name": "NodeName", "Value": "cluster-a"}],
                 }]}
 
             def get_metric_statistics(self, **_params):
@@ -467,7 +468,7 @@ class PercentileFetchTests(unittest.TestCase):
         exporter.s3 = fake_s3
         with mock.patch("builtins.print"):
             _uri, stats = exporter.export_metric_sources_to_s3(
-                [{"namespace": "AWS/ElastiCache", "dimensions": [{"Name": "CacheClusterId", "Value": "cluster-a"}]}],
+                [{"namespace": "AWS/MemoryDB", "dimensions": [{"Name": "NodeName", "Value": "cluster-a"}]}],
                 "bucket", "metrics.csv",
                 datetime(2026, 8, 10, tzinfo=timezone.utc), datetime(2026, 8, 10, 1, tzinfo=timezone.utc),
             )
@@ -483,8 +484,8 @@ class MetricExportManifestTests(unittest.TestCase):
         class FakeCloudWatch:
             def list_metrics(self, **_params):
                 return {"Metrics": [
-                    {"MetricName": "Evictions", "Dimensions": [{"Name": "CacheClusterId", "Value": "cluster-a"}]},
-                    {"MetricName": "CurrItems", "Dimensions": [{"Name": "CacheClusterId", "Value": "cluster-a"}]},
+                    {"MetricName": "Evictions", "Dimensions": [{"Name": "NodeName", "Value": "cluster-a"}]},
+                    {"MetricName": "CurrItems", "Dimensions": [{"Name": "NodeName", "Value": "cluster-a"}]},
                 ]}
 
             def get_metric_statistics(self, **params):
@@ -503,7 +504,7 @@ class MetricExportManifestTests(unittest.TestCase):
         exporter.s3 = fake_s3
         with mock.patch("builtins.print"):
             _uri, stats = exporter.export_metric_sources_to_s3(
-                [{"namespace": "AWS/ElastiCache", "dimensions": [{"Name": "CacheClusterId", "Value": "cluster-a"}]}],
+                [{"namespace": "AWS/MemoryDB", "dimensions": [{"Name": "NodeName", "Value": "cluster-a"}]}],
                 "bucket", "metrics.csv",
                 datetime(2026, 8, 10, tzinfo=timezone.utc), datetime(2026, 8, 10, 1, tzinfo=timezone.utc),
             )
@@ -519,7 +520,7 @@ class MetricExportManifestTests(unittest.TestCase):
             def list_metrics(self, **_params):
                 return {"Metrics": [{
                     "MetricName": "TrafficManagementActive",
-                    "Dimensions": [{"Name": "CacheClusterId", "Value": "cluster-a"}],
+                    "Dimensions": [{"Name": "NodeName", "Value": "cluster-a"}],
                 }]}
 
             def get_metric_statistics(self, **_params):
@@ -533,7 +534,7 @@ class MetricExportManifestTests(unittest.TestCase):
         exporter.s3 = FakeS3()
         with mock.patch("builtins.print"):
             _uri, stats = exporter.export_metric_sources_to_s3(
-                [{"namespace": "AWS/ElastiCache", "dimensions": [{"Name": "CacheClusterId", "Value": "cluster-a"}]}],
+                [{"namespace": "AWS/MemoryDB", "dimensions": [{"Name": "NodeName", "Value": "cluster-a"}]}],
                 "bucket", "metrics.csv",
                 datetime(2026, 8, 10, tzinfo=timezone.utc), datetime(2026, 8, 10, 1, tzinfo=timezone.utc),
             )
@@ -553,8 +554,8 @@ class MetricExportManifestTests(unittest.TestCase):
         class FakeCloudWatch:
             def list_metrics(self, **_params):
                 return {"Metrics": [
-                    {"MetricName": "CurrItems", "Dimensions": [{"Name": "CacheClusterId", "Value": "cluster-a"}]},
-                    {"MetricName": "TrafficManagementActive", "Dimensions": [{"Name": "CacheClusterId", "Value": "cluster-a"}]},
+                    {"MetricName": "CurrItems", "Dimensions": [{"Name": "NodeName", "Value": "cluster-a"}]},
+                    {"MetricName": "TrafficManagementActive", "Dimensions": [{"Name": "NodeName", "Value": "cluster-a"}]},
                 ]}
 
             def get_metric_statistics(self, **params):
@@ -572,7 +573,7 @@ class MetricExportManifestTests(unittest.TestCase):
         exporter.s3 = FakeS3()
         with mock.patch("builtins.print"):
             _uri, stats = exporter.export_metric_sources_to_s3(
-                [{"namespace": "AWS/ElastiCache", "dimensions": [{"Name": "CacheClusterId", "Value": "cluster-a"}]}],
+                [{"namespace": "AWS/MemoryDB", "dimensions": [{"Name": "NodeName", "Value": "cluster-a"}]}],
                 "bucket", "metrics.csv",
                 datetime(2026, 8, 10, tzinfo=timezone.utc), datetime(2026, 8, 10, 1, tzinfo=timezone.utc),
             )
@@ -589,14 +590,14 @@ class ActivityValueCheckTests(unittest.TestCase):
     were *published*, not that they carry any real signal -- a run could
     discover all three names yet have zero actual reads/writes recorded
     against them. Restored as an informational value_failures list on the
-    manifest (see the comment on export_elasticache_metrics_to_s3), never as
+    manifest (see the comment on export_memorydb_metrics_to_s3), never as
     a gate: a genuinely zero-activity run (e.g. TODO.md's write-only fill
     workload) must still produce a report.
     """
 
     @staticmethod
     def _run(exporter, metrics, datapoints_by_name):
-        class FakeElastiCache:
+        class FakeMemoryDb:
             def describe_replication_groups(self, **_params):
                 raise Exception("not available in this fake")
 
@@ -611,11 +612,11 @@ class ActivityValueCheckTests(unittest.TestCase):
             def put_object(self, **_params):
                 return {}
 
-        exporter.elasticache = FakeElastiCache()
+        exporter.memorydb = FakeMemoryDb()
         exporter.cloudwatch = FakeCloudWatch()
         exporter.s3 = FakeS3()
         with mock.patch("builtins.print"):
-            return exporter.export_elasticache_metrics_to_s3(
+            return exporter.export_memorydb_metrics_to_s3(
                 "cluster-a", "bucket", "metrics.csv",
                 datetime(2026, 8, 10, tzinfo=timezone.utc), datetime(2026, 8, 10, 1, tzinfo=timezone.utc),
             )
@@ -623,7 +624,7 @@ class ActivityValueCheckTests(unittest.TestCase):
     def test_empty_core_activity_metrics_are_flagged_but_do_not_fail_the_export(self):
         exporter = _load_exporter()
         metrics = [
-            {"MetricName": "Evictions", "Dimensions": [{"Name": "CacheClusterId", "Value": "cluster-a-001"}]},
+            {"MetricName": "Evictions", "Dimensions": [{"Name": "NodeName", "Value": "cluster-a-001"}]},
         ]
 
         manifest = self._run(exporter, metrics, {
@@ -633,7 +634,7 @@ class ActivityValueCheckTests(unittest.TestCase):
         self.assertEqual(
             manifest["value_failures"],
             [
-                "CacheHits/CacheMisses have no positive Sum datapoints",
+                "KeyspaceHits/KeyspaceMisses have no positive Sum datapoints",
                 "CurrItems has no positive Maximum datapoints",
             ],
         )
@@ -646,19 +647,103 @@ class ActivityValueCheckTests(unittest.TestCase):
     def test_positive_core_activity_metrics_clear_the_flag(self):
         exporter = _load_exporter()
         metrics = [
-            {"MetricName": "CacheHits", "Dimensions": [{"Name": "CacheClusterId", "Value": "cluster-a-001"}]},
-            {"MetricName": "CacheMisses", "Dimensions": [{"Name": "CacheClusterId", "Value": "cluster-a-001"}]},
-            {"MetricName": "CurrItems", "Dimensions": [{"Name": "CacheClusterId", "Value": "cluster-a-001"}]},
+            {"MetricName": "KeyspaceHits", "Dimensions": [{"Name": "NodeName", "Value": "cluster-a-001"}]},
+            {"MetricName": "KeyspaceMisses", "Dimensions": [{"Name": "NodeName", "Value": "cluster-a-001"}]},
+            {"MetricName": "CurrItems", "Dimensions": [{"Name": "NodeName", "Value": "cluster-a-001"}]},
         ]
         ts = datetime(2026, 8, 10, tzinfo=timezone.utc)
 
         manifest = self._run(exporter, metrics, {
-            "CacheHits": [{"Timestamp": ts, "Unit": "Count", "Sum": 100.0}],
-            "CacheMisses": [{"Timestamp": ts, "Unit": "Count", "Sum": 20.0}],
+            "KeyspaceHits": [{"Timestamp": ts, "Unit": "Count", "Sum": 100.0}],
+            "KeyspaceMisses": [{"Timestamp": ts, "Unit": "Count", "Sum": 20.0}],
             "CurrItems": [{"Timestamp": ts, "Unit": "Count", "Maximum": 50.0}],
         })
 
         self.assertEqual(manifest["value_failures"], [])
+
+
+class MemoryDbDiscoveryCoverageTests(unittest.TestCase):
+    """Every series CloudWatch publishes for the cluster must land in the CSV.
+
+    The published shapes below are the ones `aws cloudwatch list-metrics`
+    returned for a live cluster on 2026-09-29: a ClusterName-only aggregate
+    and a ClusterName+NodeName series per node for every metric, plus
+    EngineCPUUtilization under ReplicationGroupId (alone, with Role, with
+    NodeGroupId) -- which carries no ClusterName at all.
+    """
+
+    PUBLISHED = [
+        ("EngineCPUUtilization", {"ClusterName": "cluster-a"}),
+        ("EngineCPUUtilization", {"ClusterName": "cluster-a", "NodeName": "cluster-a-0001-001"}),
+        ("EngineCPUUtilization", {"ReplicationGroupId": "cluster-a"}),
+        ("EngineCPUUtilization", {"ReplicationGroupId": "cluster-a", "Role": "Primary"}),
+        ("EngineCPUUtilization", {"ReplicationGroupId": "cluster-a", "Role": "Replica"}),
+        ("EngineCPUUtilization", {"NodeGroupId": "0001", "ReplicationGroupId": "cluster-a"}),
+        ("KeyspaceHits", {"ClusterName": "cluster-a"}),
+        ("KeyspaceHits", {"ClusterName": "cluster-a", "NodeName": "cluster-a-0001-001"}),
+        # Another cluster in the same account: must not leak into this export.
+        ("KeyspaceHits", {"ClusterName": "cluster-b"}),
+    ]
+
+    def _export(self):
+        exporter = _load_exporter()
+        published = [
+            {"MetricName": name, "Dimensions": [{"Name": k, "Value": v} for k, v in dims.items()]}
+            for name, dims in self.PUBLISHED
+        ]
+
+        class FakeCloudWatch:
+            def list_metrics(self, **params):
+                # CloudWatch semantics: a series matches when it carries every
+                # requested dimension, whatever other dimensions it has.
+                wanted = {(d["Name"], d["Value"]) for d in params.get("Dimensions", [])}
+                return {"Metrics": [
+                    m for m in published
+                    if wanted <= {(d["Name"], d["Value"]) for d in m["Dimensions"]}
+                ]}
+
+            def get_metric_statistics(self, **_params):
+                return {"Datapoints": [
+                    {"Timestamp": datetime(2026, 8, 10, tzinfo=timezone.utc), "Unit": "Percent", "Average": 1.0}
+                ]}
+
+        class FakeMemoryDb:
+            def describe_clusters(self, **_params):
+                raise Exception("cluster already deleted")
+
+        uploads = {}
+
+        class FakeS3:
+            def put_object(self, **params):
+                uploads[params["Key"]] = params["Body"]
+                return {}
+
+        exporter.memorydb = FakeMemoryDb()
+        exporter.cloudwatch = FakeCloudWatch()
+        exporter.s3 = FakeS3()
+        with mock.patch("builtins.print"):
+            exporter.export_memorydb_metrics_to_s3(
+                "cluster-a", "bucket", "metrics.csv",
+                datetime(2026, 8, 10, tzinfo=timezone.utc), datetime(2026, 8, 10, 1, tzinfo=timezone.utc),
+            )
+        rows = list(csv.DictReader(io.StringIO(uploads["metrics.csv"])))
+        return {(row["MetricName"], row["Dimensions"]) for row in rows}
+
+    def test_every_published_series_of_the_cluster_is_exported(self):
+        exported = self._export()
+
+        expected = {
+            (name, ";".join(f"{k}={v}" for k, v in sorted(dims.items())))
+            for name, dims in self.PUBLISHED
+            if "cluster-a" in dims.values()
+        }
+        self.assertEqual(exported, expected)
+
+    def test_node_series_are_keyed_by_node_name(self):
+        self.assertIn(
+            ("KeyspaceHits", "ClusterName=cluster-a;NodeName=cluster-a-0001-001"),
+            self._export(),
+        )
 
 
 class ConditionalContractTests(unittest.TestCase):
@@ -666,41 +751,106 @@ class ConditionalContractTests(unittest.TestCase):
 
     def test_burstable_node_requires_cpu_credit_metrics_non_burstable_does_not(self):
         exporter = _load_exporter()
-        discovered = set(exporter.CORE_ELASTICACHE_CONTRACT_METRICS)
+        discovered = set(exporter.CORE_MEMORYDB_CONTRACT_METRICS)
 
-        non_burstable = exporter._metric_contract_status(discovered, {"elasticache": {"node_type": "cache.c7gn.large"}})
-        burstable = exporter._metric_contract_status(discovered, {"elasticache": {"node_type": "cache.t4g.micro"}})
+        non_burstable = exporter._metric_contract_status(discovered, {"memorydb": {"node_type": "db.r6g.large"}})
+        burstable = exporter._metric_contract_status(discovered, {"memorydb": {"node_type": "db.t4g.small"}})
 
         self.assertTrue(non_burstable["complete"])
         self.assertFalse(burstable["complete"])
         self.assertIn("CPUCreditBalance", burstable["missing"])
         self.assertIn("CPUCreditUsage", burstable["missing"])
 
-    def test_replication_topology_requires_replication_metrics(self):
+    def test_replicas_require_the_replication_metric_family(self):
+        """MemoryDB is always sharded, so shard count alone says nothing about
+        whether replication traffic exists -- only replicas do. A run with
+        num_replicas_per_shard = 0 must not be marked incomplete for lacking
+        metrics its topology cannot produce.
+        """
         exporter = _load_exporter()
-        discovered = set(exporter.CORE_ELASTICACHE_CONTRACT_METRICS)
+        discovered = set(exporter.CORE_MEMORYDB_CONTRACT_METRICS)
 
-        single_node = exporter._metric_contract_status(discovered, {"elasticache": {"num_cache_nodes": 1}})
-        cluster_mode = exporter._metric_contract_status(discovered, {"elasticache": {"cluster_mode_enabled": True}})
+        no_replicas = exporter._metric_contract_status(
+            discovered, {"memorydb": {"num_shards": 4, "num_replicas_per_shard": 0}}
+        )
+        with_replicas = exporter._metric_contract_status(
+            discovered, {"memorydb": {"num_shards": 1, "num_replicas_per_shard": 1}}
+        )
 
-        self.assertTrue(single_node["complete"])
-        self.assertFalse(cluster_mode["complete"])
-        self.assertIn("ReplicationLag", cluster_mode["missing"])
+        self.assertTrue(no_replicas["complete"])
+        self.assertFalse(with_replicas["complete"])
+        self.assertIn("ReplicationLag", with_replicas["missing"])
+        self.assertIn("ReplicationDelayedWriteCommands", with_replicas["missing"])
 
-    def test_four_new_names_are_in_the_core_contract(self):
+    def test_data_tiering_requires_the_disk_metric_family(self):
         exporter = _load_exporter()
+        discovered = set(exporter.CORE_MEMORYDB_CONTRACT_METRICS)
+
+        plain = exporter._metric_contract_status(discovered, {"memorydb": {"data_tiering": False}})
+        tiered = exporter._metric_contract_status(discovered, {"memorydb": {"data_tiering": True}})
+
+        self.assertTrue(plain["complete"])
+        self.assertFalse(tiered["complete"])
+        self.assertIn("BytesReadFromDisk", tiered["missing"])
+
+    def test_server_latency_is_required_only_where_the_engine_publishes_it(self):
+        """Successful{Read,Write}RequestLatency exist on Valkey 7.2+ only. A
+        healthy Redis OSS run must not be marked incomplete for lacking them,
+        and an engine the contract cannot read must keep them required.
+        """
+        exporter = _load_exporter()
+        latency = {"SuccessfulReadRequestLatency", "SuccessfulWriteRequestLatency"}
+        discovered = set(exporter.CORE_MEMORYDB_CONTRACT_METRICS) - latency
+
+        redis = exporter._metric_contract_status(
+            discovered, {"memorydb": {"engine": "redis", "engine_version_configured": "7.1"}}
+        )
+        valkey = exporter._metric_contract_status(
+            discovered, {"memorydb": {"engine": "valkey", "engine_version_configured": "7.2"}}
+        )
+        unknown = exporter._metric_contract_status(discovered, {"memorydb": {}})
+
+        self.assertTrue(redis["complete"], redis["missing"])
+        self.assertEqual(set(valkey["missing"]), latency)
+        self.assertEqual(set(unknown["missing"]), latency)
+
+    def test_core_contract_names_only_metrics_memorydb_actually_publishes(self):
+        """A contract listing metrics that cannot exist reports them missing on
+        every healthy run, and a permanently-failing contract is one people
+        learn to ignore.
+        """
+        exporter = _load_exporter()
+        contract = set(exporter.CORE_MEMORYDB_CONTRACT_METRICS)
 
         for name in (
-            "TrafficManagementActive", "ErrorCount",
-            "SuccessfulReadRequestLatency", "SuccessfulWriteRequestLatency",
+            "ErrorCount",
+            "SuccessfulReadRequestLatency",
+            "SuccessfulWriteRequestLatency",
+            "KeyspaceHits",
+            "KeyspaceMisses",
+            "BytesUsedForMemoryDB",
         ):
-            self.assertIn(name, exporter.CORE_ELASTICACHE_CONTRACT_METRICS)
+            self.assertIn(name, contract)
+
+        for absent in (
+            "CacheHits",
+            "CacheMisses",
+            "CacheHitRate",
+            "BytesUsedForCache",
+            "GetTypeCmdsLatency",
+            "SetTypeCmdsLatency",
+            "StringBasedCmdsLatency",
+            "TrafficManagementActive",
+            "DatabaseMemoryUsageCountedForEvictPercentage",
+            "DatabaseCapacityUsageCountedForEvictPercentage",
+        ):
+            self.assertNotIn(absent, contract, f"{absent} does not exist on MemoryDB")
 
     def test_missing_successful_read_request_latency_is_reported(self):
         exporter = _load_exporter()
-        discovered = set(exporter.CORE_ELASTICACHE_CONTRACT_METRICS) - {"SuccessfulReadRequestLatency"}
+        discovered = set(exporter.CORE_MEMORYDB_CONTRACT_METRICS) - {"SuccessfulReadRequestLatency"}
 
-        status = exporter._metric_contract_status(discovered, {"elasticache": {"node_type": "cache.c7gn.large"}})
+        status = exporter._metric_contract_status(discovered, {"memorydb": {"node_type": "db.r6g.large"}})
 
         self.assertFalse(status["complete"])
         self.assertEqual(status["missing"], ["SuccessfulReadRequestLatency"])
@@ -725,7 +875,7 @@ class SummaryWp2FieldDedupTests(unittest.TestCase):
     def _row(metric_name, stat, value, dimensions):
         return {
             "Timestamp": "2026-08-10T00:00:00Z",
-            "Namespace": "AWS/ElastiCache",
+            "Namespace": "AWS/MemoryDB",
             "MetricName": metric_name,
             "Stat": stat,
             "Value": value,
@@ -736,8 +886,8 @@ class SummaryWp2FieldDedupTests(unittest.TestCase):
     def test_error_count_total_is_not_double_counted(self):
         try:
             summary = self._build([
-                self._row("ErrorCount", "Sum", 4, "CacheClusterId=cluster-a"),
-                self._row("ErrorCount", "Sum", 4, "CacheClusterId=cluster-a;CacheNodeId=0001"),
+                self._row("ErrorCount", "Sum", 4, "ClusterName=cluster-a"),
+                self._row("ErrorCount", "Sum", 4, "ClusterName=cluster-a;NodeName=cluster-a-0001-001"),
             ])
         except ModuleNotFoundError as exc:
             if exc.name == "pandas":
@@ -749,15 +899,15 @@ class SummaryWp2FieldDedupTests(unittest.TestCase):
     def test_server_request_latency_p99_is_not_double_counted_across_dimension_levels(self):
         try:
             summary = self._build([
-                self._row("SuccessfulReadRequestLatency", "p99", 16.0, "CacheClusterId=cluster-a"),
-                self._row("SuccessfulReadRequestLatency", "p99", 999.0, "CacheClusterId=cluster-a;CacheNodeId=0001"),
+                self._row("SuccessfulReadRequestLatency", "p99", 16.0, "ClusterName=cluster-a"),
+                self._row("SuccessfulReadRequestLatency", "p99", 999.0, "ClusterName=cluster-a;NodeName=cluster-a-0001-001"),
             ])
         except ModuleNotFoundError as exc:
             if exc.name == "pandas":
                 self.skipTest("pandas is not installed in this environment")
             raise
 
-        # The aggregate row wins over the CacheNodeId duplicate (D6); a mean
+        # The aggregate row wins over the node-level duplicate (D6); a mean
         # across both would land nowhere near 16.0.
         self.assertEqual(summary["server_request_latency_us"]["read_p99"], 16.0)
 
@@ -790,9 +940,9 @@ class DedupMetricStatValidationTests(unittest.TestCase):
             raise
 
         df = pd.DataFrame([{
-            "Timestamp": pd.Timestamp("2026-08-10T00:00:00"), "Namespace": "AWS/ElastiCache",
+            "Timestamp": pd.Timestamp("2026-08-10T00:00:00"), "Namespace": "AWS/MemoryDB",
             "MetricName": "SuccessfulReadRequestLatency", "Stat": "Average", "Value": 5.0,
-            "Unit": "Microseconds", "Dimensions": "CacheClusterId=cluster-a",
+            "Unit": "Microseconds", "Dimensions": "ClusterName=cluster-a",
         }])
 
         with self.assertRaises(ValueError):

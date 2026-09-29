@@ -2,6 +2,8 @@
 
 import pandas as pd
 
+import metric_source
+
 # ------------------------------------------------------------------ #
 #  Design tokens / shared constants                                    #
 # ------------------------------------------------------------------ #
@@ -40,9 +42,11 @@ MEM_COLORS     = ['#9467bd', '#ff7f0e', '#8c564b', '#e377c2']
 # Deep-dive figure colours
 C_CREDIT_BAL   = '#27ae60'
 C_CREDIT_USE   = '#e74c3c'
-C_LAT_GET      = '#2196f3'
-C_LAT_SET      = '#ff5722'
-C_LAT_STR      = '#9c27b0'
+# Read vs write, deliberately far apart on the colour wheel: on MemoryDB
+# these two series are an order of magnitude apart and must never be mistaken
+# for one another.
+C_LAT_READ     = '#2196f3'
+C_LAT_WRITE    = '#ff5722'
 C_THROTTLE_IN  = '#f44336'
 C_THROTTLE_OUT = '#b71c1c'
 C_THROTTLE_PPS = '#ff9800'
@@ -54,12 +58,12 @@ C_LAT_P999     = '#7b1fa2'
 C_LAT_WORST99  = '#ff7f0e'
 C_LAT_WORST999 = '#111827'
 
-CLIENT_LATENCY_NAMESPACE = 'ElastiCache/LoadGenerator'
+CLIENT_LATENCY_NAMESPACE = metric_source.LOADGEN_NAMESPACE
 CLIENT_LATENCY_METRIC = 'ClientLatency'
 CLIENT_LATENCY_STATS = ('p50', 'p99', 'p99.9')
 
 # Minimum ratio the runner-up AZ's median latency must clear over the
-# lowest AZ's for `elasticache_availability_zone` to call a winner. Below
+# lowest AZ's for `memorydb_availability_zone` to call a winner. Below
 # this, the two AZs are within noise and the inference is not trustworthy.
 AZ_INFERENCE_MIN_SEPARATION_RATIO = 1.5
 
@@ -144,14 +148,22 @@ def client_latency_series(df):
     return merged[columns].reset_index(drop=True)
 
 
-def elasticache_availability_zone(
+def memorydb_availability_zone(
     task_latency_map=None,
     task_az_map=None,
     measured_availability_zone=None,
 ):
-    """Return the ElastiCache node AZ and whether it was measured or inferred.
+    """Return the MemoryDB node AZ and whether it was observed or inferred.
 
-    Legacy runs (no AZ in ``cluster_details.json``) infer the co-located AZ
+    MemoryDB has no AZ-placement argument, so ``cluster_details.json`` records
+    what AWS actually chose (``placement.shards[].nodes[].availability_zone``)
+    rather than what was requested. When every node landed in one AZ, that AZ
+    is passed in as *measured_availability_zone* and is authoritative. A
+    placement spanning several AZs is not passed in at all (see
+    ``report_generator._config_from_cluster_details``): the replicas sit in
+    other AZs and nothing recorded says which node is the primary.
+
+    Runs without a measured AZ infer the co-located AZ
     from the AZ-level median of each task's final memtier p50 latency
     (``*.totals.json``): tasks sharing an AZ with the node see lower latency.
 
@@ -214,23 +226,23 @@ def elasticache_availability_zone(
     }
 
 
-def ecs_task_index_map(task_ids, task_az_map=None, elasticache_az=None):
-    """Assign deterministic fleet-wide task indexes with ElastiCache AZ first."""
+def ecs_task_index_map(task_ids, task_az_map=None, memorydb_az=None):
+    """Assign deterministic fleet-wide task indexes with the MemoryDB AZ first."""
     task_az_map = task_az_map or {}
     normalized_ids = sorted({
         str(task_id)
         for task_id in task_ids
         if task_id is not None and str(task_id)
     })
-    redis_az = str(elasticache_az or '').strip()
+    cluster_az = str(memorydb_az or '').strip()
     known_azs = sorted({
         str(task_az_map.get(task_id))
         for task_id in normalized_ids
         if task_az_map.get(task_id)
         and str(task_az_map.get(task_id)).lower() != 'unknown'
     })
-    ordered_azs = ([redis_az] if redis_az in known_azs else []) + [
-        az for az in known_azs if az != redis_az
+    ordered_azs = ([cluster_az] if cluster_az in known_azs else []) + [
+        az for az in known_azs if az != cluster_az
     ]
     az_rank = {az: rank for rank, az in enumerate(ordered_azs)}
 
@@ -315,16 +327,19 @@ def ecs_task_metric_distribution(df, metric_name, stat, value_scale=1.0):
     return result.sort_values('Timestamp').reset_index(drop=True)[columns]
 
 
-def cache_hit_rate_df(df):
-    """Return CacheHitRate/Average rows, deriving them from CacheHits/CacheMisses when needed."""
-    direct = metric_filter(df, 'CacheHitRate', 'Average', 'CacheClusterId')
-    if not direct.empty:
-        return direct
+def keyspace_hit_rate_df(df):
+    """Return a derived hit-rate series from KeyspaceHits/KeyspaceMisses.
 
-    hits = metric_filter(df, 'CacheHits', 'Sum', 'CacheClusterId')
-    misses = metric_filter(df, 'CacheMisses', 'Sum', 'CacheClusterId')
+    Always derived, never read directly: MemoryDB publishes no CacheHitRate
+    equivalent. The source project tried a direct lookup first and fell back
+    to deriving; keeping that fallback here would mean a lookup that can only
+    ever miss, which reads like a supported path and is not one.
+    """
+    hits = metric_filter(df, metric_source.KEYSPACE_HITS, 'Sum', metric_source.CLUSTER_DIMENSION)
+    misses = metric_filter(df, metric_source.KEYSPACE_MISSES, 'Sum', metric_source.CLUSTER_DIMENSION)
+    empty = df.iloc[0:0]
     if hits.empty or misses.empty:
-        return direct
+        return empty
 
     hit_cols = hits[['Timestamp', 'Dimensions', 'Value']].rename(columns={'Value': 'Hits'})
     miss_cols = misses[['Timestamp', 'Dimensions', 'Value']].rename(columns={'Value': 'Misses'})
@@ -332,55 +347,51 @@ def cache_hit_rate_df(df):
     total = merged['Hits'] + merged['Misses']
     merged = merged[total > 0].copy()
     if merged.empty:
-        return direct
+        return empty
 
     merged['Value'] = (merged['Hits'] / (merged['Hits'] + merged['Misses'])) * 100.0
-    merged['Namespace'] = 'AWS/ElastiCache'
-    merged['MetricName'] = 'CacheHitRate'
+    merged['Namespace'] = metric_source.NAMESPACE
+    merged['MetricName'] = 'KeyspaceHitRate'
     merged['Stat'] = 'Average'
     merged['Unit'] = 'Percent'
     return merged[['Timestamp', 'Namespace', 'MetricName', 'Stat', 'Value', 'Unit', 'Dimensions']]
 
 
 def select_node_dimension_rows(df, cluster_id=None):
-    """Return per-node rows without mixing the CacheClusterId aggregate with
-    its CacheNodeId duplicates. Extracted from cloudwatch_eviction_series.
+    """Return one set of rows per metric without double-counting.
 
     *df* must already be filtered to one MetricName/Stat combination (see
-    ``metric_filter``). AWS/ElastiCache publishes most node-level metrics at
-    both the ``CacheClusterId`` (per-node aggregate) and
-    ``CacheClusterId;CacheNodeId`` (also per-node, same values) dimension
-    levels; summing both double-counts. This covers only that axis --
-    ``NodeGroupId`` is a second, narrower duplicate axis (cluster mode) not
-    yet folded in here (see PLAN_2.md WP1 step 1).
+    ``metric_filter``). MemoryDB publishes most metrics at both the cluster
+    level (``ClusterName=x``) and the node level
+    (``ClusterName=x;NodeName=y``), with the cluster row being the aggregate;
+    summing both counts everything twice.
+
+    Simpler than the ElastiCache original, and deliberately so. There, the
+    node dimension (``CacheClusterId``) doubled as the cluster dimension for
+    non-cluster-mode groups, so a bare ``CacheClusterId=<rg>-001`` could be
+    either an aggregate or one node and the code had to guess. MemoryDB keeps
+    the two dimensions distinct, so the aggregate is exactly the row with no
+    node dimension. There is also no ``NodeGroupId`` third axis to fold in.
     """
     if df.empty:
         return df
 
     dimensions = df['Dimensions'].astype(str)
     if cluster_id:
-        exact_dimension = f'CacheClusterId={cluster_id}'
-        cluster_prefix = f'{exact_dimension}-'
+        exact_dimension = metric_source.cluster_dim(cluster_id)
         candidates = df[
             dimensions.eq(exact_dimension)
             | dimensions.str.startswith(f'{exact_dimension};')
-            | dimensions.str.startswith(cluster_prefix)
         ]
         if candidates.empty:
             return candidates
         candidate_dims = candidates['Dimensions'].astype(str)
         aggregate = candidates[candidate_dims == exact_dimension]
-        if aggregate.empty:
-            # Non-cluster ElastiCache metrics use node-scoped CacheClusterId values
-            # like "<replication-group>-001". If a bare aggregate series exists for
-            # one of those IDs, keep exactly that series instead of also summing
-            # CacheNodeId rows.
-            bare_rows = candidates[candidate_dims.str.match(r'^CacheClusterId=[^;]+$')]
-            bare_ids = bare_rows['Dimensions'].unique()
-            aggregate = bare_rows if len(bare_ids) == 1 else bare_rows.iloc[0:0]
-        node_rows = candidates[candidate_dims.str.contains(';CacheNodeId=')]
+        node_rows = candidates[
+            candidate_dims.str.contains(f';{metric_source.NODE_DIMENSION}=')
+        ]
     else:
-        aggregate_mask = dimensions.str.match(r'^CacheClusterId=[^;]+$')
+        aggregate_mask = dimensions.str.match(metric_source.CLUSTER_ONLY_PATTERN)
         aggregate = df[aggregate_mask]
         node_rows = df[~aggregate_mask]
 
@@ -389,17 +400,17 @@ def select_node_dimension_rows(df, cluster_id=None):
 
 def cloudwatch_eviction_series(df, cluster_id=None):
     """Return one CloudWatch Evictions series without mixing aggregate and node rows."""
-    evictions = metric_filter(df, 'Evictions', 'Sum', 'CacheClusterId')
+    evictions = metric_filter(df, 'Evictions', 'Sum', metric_source.CLUSTER_DIMENSION)
     selected = select_node_dimension_rows(evictions, cluster_id)
     if selected.empty:
         return selected
 
     series = selected.groupby('Timestamp', as_index=False)['Value'].sum()
-    series['Namespace'] = 'AWS/ElastiCache'
+    series['Namespace'] = metric_source.NAMESPACE
     series['MetricName'] = 'Evictions'
     series['Stat'] = 'Sum'
     series['Unit'] = selected['Unit'].iloc[0] if 'Unit' in selected else 'Count'
-    series['Dimensions'] = f'CacheClusterId={cluster_id}' if cluster_id else 'selected_eviction_series'
+    series['Dimensions'] = metric_source.cluster_dim(cluster_id) if cluster_id else 'selected_eviction_series'
     return series[['Timestamp', 'Namespace', 'MetricName', 'Stat', 'Value', 'Unit', 'Dimensions']]
 
 
@@ -447,11 +458,13 @@ def aggregate_memtier_progress(df):
 def shorten_dim(dim, cluster_id=''):
     """Return a concise label from a CloudWatch Dimensions string.
 
-    Prefers NodeGroupId value (e.g. '0001') or strips the cluster_id prefix
-    from a ClusterName/ServiceName value so legends stay readable.
+    Prefers the node id, else strips the cluster_id prefix from a
+    ClusterName/ServiceName value so legends stay readable. MemoryDB has no
+    NodeGroupId dimension, so unlike the ElastiCache original there is only
+    one node-identifying key to try.
     """
     kv = dict(part.split('=', 1) for part in dim.split(';') if '=' in part)
-    for key in ('NodeGroupId', 'CacheClusterId'):
+    for key in (metric_source.NODE_DIMENSION,):
         if key in kv:
             return kv[key]
     for key in ('ServiceName', 'ClusterName'):
@@ -468,24 +481,22 @@ def shorten_dim(dim, cluster_id=''):
 def select_mem_dims(dim_series, node_count):
     """Choose which CloudWatch dimension sets to plot for memory metrics.
 
-    Single-node  (node_count == 1): show only the cluster aggregate dimension.
-    Multi-node   (node_count > 1): show one line per shard (NodeGroupId level),
-    falling back to one line per CacheNodeId when shard dimensions are absent.
+    Single node (node_count == 1): the cluster aggregate only.
+    More than one node: one line per node.
+
+    MemoryDB has two dimension levels, not three. The ElastiCache original
+    had a NodeGroupId (per-shard) level between the aggregate and the node,
+    and preferred it; here shard identity is carried in the node name
+    (``{cluster}-{shard:04d}-{node:03d}``) rather than in a dimension, so
+    there is nothing to prefer and no third branch.
     """
     unique = list(dict.fromkeys(dim_series))
 
-    def has_node_group(d):
-        return 'NodeGroupId=' in d
+    def is_node_level(d):
+        return f';{metric_source.NODE_DIMENSION}=' in d
 
-    def has_cache_node(d):
-        return 'CacheNodeId=' in d
-
-    per_shard = [d for d in unique if has_node_group(d)]
-    per_node = [d for d in unique if has_cache_node(d) and not has_node_group(d)]
-    aggregate = [
-        d for d in unique
-        if not has_node_group(d) and not has_cache_node(d)
-    ]
+    per_node = [d for d in unique if is_node_level(d)]
+    aggregate = [d for d in unique if not is_node_level(d)]
 
     try:
         n = int(node_count)
@@ -493,8 +504,7 @@ def select_mem_dims(dim_series, node_count):
         n = 0
 
     if n <= 1:
-        # ``node_count`` is unavailable for cluster-mode runs.  In that case
-        # retain every shard series rather than silently computing cards from
-        # an arbitrary single shard.
-        return aggregate if aggregate else (per_shard if per_shard else per_node)
-    return per_shard if per_shard else (per_node if per_node else aggregate)
+        # node_count can be unavailable. Retain every node series rather than
+        # silently computing cards from one arbitrary node.
+        return aggregate if aggregate else per_node
+    return per_node if per_node else aggregate

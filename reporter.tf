@@ -1,8 +1,3 @@
-# =============================================================================
-# UNPORTED — copied verbatim from tests-aws-elasticache-redis @ HEAD.
-# This file still targets ElastiCache. See PLAN.md, work package WP5.
-# =============================================================================
-
 locals {
   reporter_modules = toset([
     "report_generator.py",
@@ -20,6 +15,10 @@ locals {
     "memtier_etl.py",
     "formatting.py",
     "comparison_contract.py",
+    # Imported at module load by exporter.py and most of the report chain.
+    # Missing here, the task dies on `import metric_source` before exporting
+    # anything. tests/test_reporter_module_packaging.py guards both lists.
+    "metric_source.py",
   ])
   reporter_scripts_prefix = "scripts/${local.cluster_id}/"
 }
@@ -104,25 +103,24 @@ resource "aws_ecs_task_definition" "reporter" {
       # NOTE: This approach installs dependencies at runtime instead of a
       # pre-built image. For production use, consider building a custom
       # Docker image with pre-installed dependencies (see reporter/Dockerfile
-      # and reporter/requirements.txt) and pushing it to ECR. This eliminates
-      # supply chain risk from a compromised PyPI release between runs and
-      # reduces task startup time. WP3 (PLAN_2.md) narrows that risk with
-      # exact pins + a pip freeze record below; it doesn't close it.
+      # and reporter/requirements.txt) and pushing it to ECR, which also cuts
+      # task startup time.
       command = ["sh", "-c",
         <<-EOT
           set -e
 
-          # All three exact pins, kept in sync with reporter/requirements.txt
-          # (tests/test_reporter_dependency_pins.py checks it). plotly
-          # specifically also needs re-verification on bump, not just a
-          # synced pin: charts.py reads its private subplot internals
-          # (fig._grid_ref, trace_kwargs, layout_keys), which can change
-          # shape on any release with no warning.
-          pip install --no-cache-dir "boto3==1.35.81" "pandas==2.2.3" "plotly==6.9.0"
+          # Deliberately unpinned: every run installs the newest boto3,
+          # pandas and plotly, and a release that breaks the reporter is a
+          # finding to fix, not something to hold off with a pin. Same
+          # package list as reporter/requirements.txt
+          # (tests/test_reporter_dependencies.py checks it). plotly is the
+          # likeliest to break: charts.py reads its private subplot internals
+          # (fig._grid_ref, trace_kwargs, layout_keys).
+          pip install --no-cache-dir boto3 pandas plotly
 
-          # Provenance of the software that actually ran, not just what was
-          # requested: an exact pin still leaves the platform-specific wheel
-          # PyPI happened to resolve. Passed to exporter.py as an env var
+          # Provenance of the software that actually ran: with nothing
+          # pinned, this is the only record of which versions a given report
+          # was built with. Passed to exporter.py as an env var
           # (base64 to survive shell->env transit unmangled) rather than a
           # file, since nothing after this point shares a filesystem with it.
           export PIP_FREEZE_B64="$(pip freeze | base64 -w0)"
@@ -149,6 +147,7 @@ modules = [
     "memtier_etl.py",
     "formatting.py",
     "comparison_contract.py",
+    "metric_source.py",
 ]
 
 s3 = boto3.client("s3")
@@ -188,7 +187,7 @@ PY
           value = local.run_folder
         },
         {
-          name  = "ELASTICACHE_ID"
+          name  = "MEMORYDB_CLUSTER_NAME"
           value = local.cluster_id
         },
         {
@@ -212,10 +211,6 @@ PY
           value = aws_cloudwatch_log_group.container_insights.name
         },
         {
-          name  = "ELASTICACHE_LOG_GROUP"
-          value = aws_cloudwatch_log_group.elasticache.name
-        },
-        {
           name  = "LAMBDA_SCHEDULER_LOG_GROUP"
           value = aws_cloudwatch_log_group.lambda_shutdown_scheduler.name
         },
@@ -224,20 +219,16 @@ PY
           value = tostring(var.test_duration_minutes)
         },
         {
-          name  = "CLUSTER_MODE"
-          value = tostring(var.cluster_mode_enabled)
+          name  = "NUM_NODES"
+          value = tostring(local.memorydb_node_count)
         },
         {
-          name  = "NUM_CACHE_NODES"
-          value = tostring(var.num_cache_nodes)
+          name  = "NUM_SHARDS"
+          value = tostring(var.num_shards)
         },
         {
-          name  = "NUM_NODE_GROUPS"
-          value = tostring(var.num_node_groups)
-        },
-        {
-          name  = "REPLICAS_PER_NODE_GROUP"
-          value = tostring(var.replicas_per_node_group)
+          name  = "NUM_REPLICAS_PER_SHARD"
+          value = tostring(var.num_replicas_per_shard)
         },
         {
           name  = "ENGINE_TYPE"
@@ -269,7 +260,7 @@ PY
         },
         {
           name  = "NODE_COUNT"
-          value = tostring(var.cluster_mode_enabled ? var.num_node_groups : var.num_cache_nodes)
+          value = tostring(local.memorydb_node_count)
         },
         {
           name  = "NOTIFICATION_EMAIL"

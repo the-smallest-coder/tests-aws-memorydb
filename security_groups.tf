@@ -1,19 +1,14 @@
-# =============================================================================
-# UNPORTED — copied verbatim from tests-aws-elasticache-redis @ HEAD.
-# This file still targets ElastiCache. See PLAN.md, work package WP1.
-# =============================================================================
-
 data "aws_vpc" "selected" {
   id = var.vpc_id
 }
 
-resource "aws_security_group" "elasticache" {
+resource "aws_security_group" "memorydb" {
   name_prefix = "${local.cluster_id}-"
-  description = "Security group for ElastiCache ${var.engine_type} cluster"
+  description = "Security group for MemoryDB ${var.engine_type} cluster"
   vpc_id      = var.vpc_id
 
   tags = {
-    Name = "${local.cluster_id}-elasticache"
+    Name = "${local.cluster_id}-memorydb"
   }
 
   lifecycle {
@@ -21,8 +16,8 @@ resource "aws_security_group" "elasticache" {
   }
 }
 
-resource "aws_vpc_security_group_ingress_rule" "elasticache_access" {
-  security_group_id = aws_security_group.elasticache.id
+resource "aws_vpc_security_group_ingress_rule" "memorydb_access" {
+  security_group_id = aws_security_group.memorydb.id
   description       = "Allow ${var.engine_type} access from VPC"
 
   from_port   = var.port
@@ -34,10 +29,10 @@ resource "aws_vpc_security_group_ingress_rule" "elasticache_access" {
 }
 
 # Additional ingress rules for multiple CIDR blocks if specified
-resource "aws_vpc_security_group_ingress_rule" "elasticache_access_additional" {
+resource "aws_vpc_security_group_ingress_rule" "memorydb_access_additional" {
   count = length(var.allowed_cidr_blocks) > 1 ? length(var.allowed_cidr_blocks) - 1 : 0
 
-  security_group_id = aws_security_group.elasticache.id
+  security_group_id = aws_security_group.memorydb.id
   description       = "Allow ${var.engine_type} access from additional CIDR ${count.index + 1}"
 
   from_port   = var.port
@@ -46,8 +41,8 @@ resource "aws_vpc_security_group_ingress_rule" "elasticache_access_additional" {
   cidr_ipv4   = var.allowed_cidr_blocks[count.index + 1]
 }
 
-resource "aws_vpc_security_group_egress_rule" "elasticache_egress" {
-  security_group_id = aws_security_group.elasticache.id
+resource "aws_vpc_security_group_egress_rule" "memorydb_egress" {
+  security_group_id = aws_security_group.memorydb.id
   description       = "Allow all outbound traffic"
 
   ip_protocol = "-1"
@@ -69,7 +64,7 @@ resource "aws_security_group" "loadgen" {
   }
 }
 
-# Allow all outbound traffic from load generator (to reach ElastiCache)
+# Allow all outbound traffic from load generator (to reach MemoryDB)
 resource "aws_vpc_security_group_egress_rule" "loadgen_egress" {
   security_group_id = aws_security_group.loadgen.id
   description       = "Allow all outbound traffic"
@@ -78,9 +73,9 @@ resource "aws_vpc_security_group_egress_rule" "loadgen_egress" {
   cidr_ipv4   = "0.0.0.0/0"
 }
 
-# Allow ECS load generator tasks to connect to ElastiCache
-resource "aws_vpc_security_group_ingress_rule" "elasticache_from_loadgen" {
-  security_group_id            = aws_security_group.elasticache.id
+# Allow ECS load generator tasks to connect to MemoryDB
+resource "aws_vpc_security_group_ingress_rule" "memorydb_from_loadgen" {
+  security_group_id            = aws_security_group.memorydb.id
   description                  = "Allow ${var.engine_type} access from load generator tasks"
   referenced_security_group_id = aws_security_group.loadgen.id
 

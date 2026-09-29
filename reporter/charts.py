@@ -10,14 +10,16 @@ from helpers import (
     C_CPU_ECS, C_ENGINE_CPU, C_NET_TX_ECS, C_NET_TX_CACHE, C_ECS_MEM,
     MEM_COLORS,
     C_CREDIT_BAL, C_CREDIT_USE,
-    C_LAT_GET, C_LAT_SET, C_LAT_STR,
+    C_LAT_READ, C_LAT_WRITE,
     C_THROTTLE_IN, C_THROTTLE_OUT, C_THROTTLE_PPS,
     C_CURR_CONN, C_MEM_FRAG,
     C_LAT_P50, C_LAT_P99, C_LAT_P999, C_LAT_WORST99, C_LAT_WORST999,
-    metric_filter, cache_hit_rate_df, shorten_dim, select_mem_dims, cloudwatch_eviction_series,
+    metric_filter, keyspace_hit_rate_df, shorten_dim, select_mem_dims, cloudwatch_eviction_series,
     client_latency_series, ecs_task_metric_distribution, ecs_task_metric_rows,
     ecs_task_index_map,
 )
+
+import metric_source
 
 ABS_TIME_HOVER = "%{customdata}"
 
@@ -240,7 +242,7 @@ def build_memtier_figure(memtier_df, oom_df, metrics_df, x_min, x_max):
 
     # ---- Row 5: Cache Hit Rate ----
     if not metrics_df.empty:
-        hr_df = cache_hit_rate_df(metrics_df)
+        hr_df = keyspace_hit_rate_df(metrics_df)
         if not hr_df.empty:
             hr_agg = hr_df.groupby('Timestamp')['Value'].mean().reset_index()
             fig.add_trace(go.Scatter(
@@ -252,10 +254,10 @@ def build_memtier_figure(memtier_df, oom_df, metrics_df, x_min, x_max):
                 hovertemplate=f"{ABS_TIME_HOVER}<br><b>%{{y:.1f}}%</b><extra></extra>"
             ), row=5, col=1)
         else:
-            fig.add_annotation(text="No CacheHitRate metric", xref="paper", yref="paper",
+            fig.add_annotation(text="No KeyspaceHits/KeyspaceMisses data to derive hit rate from", xref="paper", yref="paper",
                                x=0.5, y=0.04, showarrow=False)
     else:
-        fig.add_annotation(text="No ElastiCache metrics", xref="paper", yref="paper",
+        fig.add_annotation(text="No MemoryDB metrics", xref="paper", yref="paper",
                            x=0.5, y=0.04, showarrow=False)
 
     # ---- Axes styling ----
@@ -361,8 +363,8 @@ def build_infra_figure(
     x_max=None,
     task_az_map=None,
     task_index_by_id=None,
-    elasticache_az=None,
-    elasticache_az_source=None,
+    memorydb_az=None,
+    memorydb_az_source=None,
 ):
     """Build infrastructure panels with dynamic per-AZ ECS CPU detail.
 
@@ -388,7 +390,7 @@ def build_infra_figure(
     default_task_indexes = ecs_task_index_map(
         all_task_ids,
         task_az_map=chart_task_az,
-        elasticache_az=elasticache_az,
+        memorydb_az=memorydb_az,
     )
     supplied_indexes = task_index_by_id or {}
     used_indexes = set()
@@ -413,7 +415,7 @@ def build_infra_figure(
         for az, group in known_cpu_rows.groupby('AvailabilityZone', sort=False)
     ] if not known_cpu_rows.empty else []
     az_groups.sort(key=lambda item: (
-        0 if item[0] == elasticache_az else 1,
+        0 if item[0] == memorydb_az else 1,
         item[0],
     ))
     az_count = len(az_groups)
@@ -425,16 +427,16 @@ def build_infra_figure(
     subplot_titles = ["ECS Tasks — CPU Across Tasks (%)"]
     for az, group in az_groups:
         title = f"{az} — {group['TaskId'].nunique()} tasks"
-        if az == elasticache_az:
-            if elasticache_az_source == 'inferred_from_memtier_task_p50_latency':
-                title += " — ElastiCache AZ (inferred from memtier task latency)"
+        if az == memorydb_az:
+            if memorydb_az_source == 'inferred_from_memtier_task_p50_latency':
+                title += " — MemoryDB AZ (inferred from memtier task latency)"
             else:
-                title += " — ElastiCache AZ"
+                title += " — MemoryDB AZ"
         subplot_titles.append(title)
     subplot_titles.extend((
         "ECS Tasks — Network TX (KB/min)",
         "ECS Tasks — Memory (MB)",
-        "ElastiCache Memory Usage (%)",
+        "MemoryDB Memory Usage (%)",
         "ECS Task Latency (ms)",
     ))
 
@@ -503,7 +505,7 @@ def build_infra_figure(
         _add_empty_panel_annotation(fig, 1, "No CPU Data")
 
     if not metrics_df.empty:
-        eng_cpu_df = metric_filter(metrics_df, 'EngineCPUUtilization', 'Average', 'CacheClusterId')
+        eng_cpu_df = metric_filter(metrics_df, 'EngineCPUUtilization', 'Average', metric_source.CLUSTER_DIMENSION)
         if not eng_cpu_df.empty:
             keep_dims = select_mem_dims(
                 eng_cpu_df['Dimensions'], config.get('node_count', 1)
@@ -567,7 +569,7 @@ def build_infra_figure(
             row=az_index, col=1,
         )
 
-    # ---- ECS Network TX + ElastiCache NetworkBytesOut overlay ----
+    # ---- ECS Network TX + MemoryDB NetworkBytesOut overlay ----
     if not ecs_df.empty:
         tx_dist = ecs_task_metric_distribution(ecs_df, 'NetworkTxBytes', 'Sum', value_scale=1 / 1024.0)
         if not tx_dist.empty:
@@ -614,7 +616,7 @@ def build_infra_figure(
         _add_empty_panel_annotation(fig, network_row, "No ECS Network TX Data")
 
     if not metrics_df.empty:
-        ec_tx_df = metric_filter(metrics_df, 'NetworkBytesOut', 'Sum', 'CacheClusterId')
+        ec_tx_df = metric_filter(metrics_df, 'NetworkBytesOut', 'Sum', metric_source.CLUSTER_DIMENSION)
         if not ec_tx_df.empty:
             ec_tx_agg = ec_tx_df.groupby('Timestamp')['Value'].sum().reset_index()
             ec_tx_agg['Value'] = ec_tx_agg['Value'] / 1024.0
@@ -649,11 +651,15 @@ def build_infra_figure(
     else:
         _add_empty_panel_annotation(fig, ecs_memory_row, "No ECS Memory Data")
 
-    # ---- Row 4: ElastiCache Memory Usage (%) ----
+    # ---- Row 4: MemoryDB Memory Usage (%) ----
+    # MemoryDB publishes DatabaseMemoryUsagePercentage and
+    # DatabaseCapacityUsagePercentage but not the *CountedForEvict variants,
+    # so this is usage against total memory, not against the eviction
+    # threshold.
     if not metrics_df.empty:
-        mem_df = metric_filter(metrics_df, 'DatabaseMemoryUsageCountedForEvictPercentage', 'Average')
+        mem_df = metric_filter(metrics_df, 'DatabaseMemoryUsagePercentage', 'Average')
         if mem_df.empty:
-            mem_df = metric_filter(metrics_df, 'DatabaseCapacityUsageCountedForEvictPercentage', 'Average')
+            mem_df = metric_filter(metrics_df, 'DatabaseCapacityUsagePercentage', 'Average')
         if not mem_df.empty:
             keep_dims = select_mem_dims(mem_df['Dimensions'], config.get('node_count', 1))
             mem_df = mem_df[mem_df['Dimensions'].isin(keep_dims)]
@@ -729,8 +735,8 @@ def build_infra_panels(
     x_max=None,
     task_az_map=None,
     task_index_by_id=None,
-    elasticache_az=None,
-    elasticache_az_source=None,
+    memorydb_az=None,
+    memorydb_az_source=None,
 ):
     """Return equal-height Infrastructure plots with external HTML legends."""
     combined = build_infra_figure(
@@ -742,8 +748,8 @@ def build_infra_panels(
         x_max,
         task_az_map=task_az_map,
         task_index_by_id=task_index_by_id,
-        elasticache_az=elasticache_az,
-        elasticache_az_source=elasticache_az_source,
+        memorydb_az=memorydb_az,
+        memorydb_az_source=memorydb_az_source,
     )
     panels = []
     row_count = len(combined._grid_ref)
@@ -852,10 +858,10 @@ def build_infra_panels(
 
 
 # ------------------------------------------------------------------ #
-#  GROUP 3 — ElastiCache Deep-Dive figure                              #
+#  GROUP 3 — MemoryDB Deep-Dive figure                              #
 # ------------------------------------------------------------------ #
 
-def build_elasticache_deep_dive_figure(metrics_df, cluster_id, config=None, x_min=None, x_max=None):
+def build_memorydb_deep_dive_figure(metrics_df, cluster_id, config=None, x_min=None, x_max=None):
     """Build a 4-row deep-dive figure for configuration comparison.
 
     Rows: CPU Credits | Command Latency | Network Throttling | Connections & Fragmentation.
@@ -882,14 +888,14 @@ def build_elasticache_deep_dive_figure(metrics_df, cluster_id, config=None, x_mi
     )
 
     if metrics_df.empty:
-        fig.add_annotation(text="No ElastiCache metrics available",
+        fig.add_annotation(text="No MemoryDB metrics available",
                            xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
         fig.update_layout(**LAYOUT_BASE, height=1100)
         return fig
 
     # ---- Row 1: CPU Credits ----
-    bal_df = metric_filter(metrics_df, 'CPUCreditBalance', 'Average', 'CacheClusterId')
-    use_df = metric_filter(metrics_df, 'CPUCreditUsage',  'Average', 'CacheClusterId')
+    bal_df = metric_filter(metrics_df, 'CPUCreditBalance', 'Average', metric_source.CLUSTER_DIMENSION)
+    use_df = metric_filter(metrics_df, 'CPUCreditUsage',  'Average', metric_source.CLUSTER_DIMENSION)
     if not bal_df.empty:
         bal_agg = bal_df.groupby('Timestamp')['Value'].mean().reset_index()
         fig.add_trace(go.Scatter(
@@ -914,15 +920,27 @@ def build_elasticache_deep_dive_figure(metrics_df, cluster_id, config=None, x_mi
         fig.add_annotation(text="No CPU credit data (non-burstable instance?)",
                            xref="paper", yref="paper", x=0.5, y=0.875, showarrow=False)
 
-    # ---- Row 2: Command Latency ----
-    get_df = metric_filter(metrics_df, 'GetTypeCmdsLatency',    'Average', 'CacheClusterId')
-    set_df = metric_filter(metrics_df, 'SetTypeCmdsLatency',    'Average', 'CacheClusterId')
-    str_df = metric_filter(metrics_df, 'StringBasedCmdsLatency','Average', 'CacheClusterId')
+    # ---- Row 2: Server-side Request Latency ----
+    #
+    # MemoryDB publishes none of GetTypeCmdsLatency, SetTypeCmdsLatency or
+    # StringBasedCmdsLatency. Its replacement is the
+    # Successful{Read,Write}RequestLatency pair -- true percentiles in
+    # microseconds, and Valkey 7.2+ only, which is why valkey is the default
+    # engine here.
+    #
+    # Read and write are plotted as two separate traces and are never averaged
+    # into one series. MemoryDB commits every write to a multi-AZ transaction
+    # log, so writes sit roughly an order of magnitude above reads by design;
+    # one blended line would hide exactly the thing this project measures.
+    #
+    # Caveat worth knowing when reading this panel: pipelining inflates both
+    # metrics. A run with --pipeline > 1 reads high here.
+    read_df = metric_filter(metrics_df, metric_source.READ_LATENCY, 'Average', metric_source.CLUSTER_DIMENSION)
+    write_df = metric_filter(metrics_df, metric_source.WRITE_LATENCY, 'Average', metric_source.CLUSTER_DIMENSION)
     lat_shown = False
     for mdf, label, color, dash in [
-        (get_df, "GET latency",    C_LAT_GET, 'solid'),
-        (set_df, "SET latency",    C_LAT_SET, 'dot'),
-        (str_df, "String latency", C_LAT_STR, 'dash'),
+        (read_df, "Read latency", C_LAT_READ, 'solid'),
+        (write_df, "Write latency", C_LAT_WRITE, 'dot'),
     ]:
         if not mdf.empty:
             agg = mdf.groupby('Timestamp')['Value'].mean().reset_index()
@@ -936,13 +954,13 @@ def build_elasticache_deep_dive_figure(metrics_df, cluster_id, config=None, x_mi
             ), row=2, col=1)
             lat_shown = True
     if not lat_shown:
-        fig.add_annotation(text="No command latency data",
+        fig.add_annotation(text="No server-side latency data (requires Valkey 7.2+)",
                            xref="paper", yref="paper", x=0.5, y=0.625, showarrow=False)
 
     # ---- Row 3: Network Throttling ----
-    bw_in_df  = metric_filter(metrics_df, 'NetworkBandwidthInAllowanceExceeded',      'Sum', 'CacheClusterId')
-    bw_out_df = metric_filter(metrics_df, 'NetworkBandwidthOutAllowanceExceeded',     'Sum', 'CacheClusterId')
-    pps_df    = metric_filter(metrics_df, 'NetworkPacketsPerSecondAllowanceExceeded', 'Sum', 'CacheClusterId')
+    bw_in_df  = metric_filter(metrics_df, 'NetworkBandwidthInAllowanceExceeded',      'Sum', metric_source.CLUSTER_DIMENSION)
+    bw_out_df = metric_filter(metrics_df, 'NetworkBandwidthOutAllowanceExceeded',     'Sum', metric_source.CLUSTER_DIMENSION)
+    pps_df    = metric_filter(metrics_df, 'NetworkPacketsPerSecondAllowanceExceeded', 'Sum', metric_source.CLUSTER_DIMENSION)
     throttle_shown = False
     for mdf, label, color in [
         (bw_in_df,  "BW In exceeded",  C_THROTTLE_IN),
@@ -966,8 +984,8 @@ def build_elasticache_deep_dive_figure(metrics_df, cluster_id, config=None, x_mi
                            xref="paper", yref="paper", x=0.5, y=0.375, showarrow=False)
 
     # ---- Row 4: Connections & Memory Fragmentation Ratio ----
-    conn_df = metric_filter(metrics_df, 'CurrConnections',         'Average', 'CacheClusterId')
-    frag_df = metric_filter(metrics_df, 'MemoryFragmentationRatio','Average', 'CacheClusterId')
+    conn_df = metric_filter(metrics_df, 'CurrConnections',         'Average', metric_source.CLUSTER_DIMENSION)
+    frag_df = metric_filter(metrics_df, 'MemoryFragmentationRatio','Average', metric_source.CLUSTER_DIMENSION)
     if not conn_df.empty:
         conn_agg = conn_df.groupby('Timestamp')['Value'].mean().reset_index()
         fig.add_trace(go.Scatter(

@@ -194,12 +194,14 @@ class EcsDistributionReportTests(unittest.TestCase):
                 self.skipTest(f"{exc.name} is not installed in this environment")
             raise
 
-        aggregate = "CacheClusterId=cluster-a"
-        cache_node = "CacheClusterId=cluster-a;CacheNodeId=0001"
+        aggregate = "ClusterName=cluster-a"
+        cache_node = "ClusterName=cluster-a;NodeName=cluster-a-0001-001"
         self.assertEqual(select_mem_dims([aggregate, cache_node], 1), [aggregate])
-        shard_a = "CacheClusterId=cluster-a;NodeGroupId=0001"
-        shard_b = "CacheClusterId=cluster-a;NodeGroupId=0002"
-        self.assertEqual(select_mem_dims([shard_a, shard_b], None), [shard_a, shard_b])
+        # node_count unknown and no aggregate row: keep every node series
+        # rather than silently computing from one arbitrary node.
+        node_a = "ClusterName=cluster-a;NodeName=cluster-a-0001-001"
+        node_b = "ClusterName=cluster-a;NodeName=cluster-a-0002-001"
+        self.assertEqual(select_mem_dims([node_a, node_b], None), [node_a, node_b])
 
         metrics_df = pd.DataFrame([
             self._metric_row(
@@ -211,7 +213,7 @@ class EcsDistributionReportTests(unittest.TestCase):
             )
             for value, dimensions in ((50.0, aggregate), (50.0, cache_node))
         ])
-        metrics_df["Namespace"] = "AWS/ElastiCache"
+        metrics_df["Namespace"] = "AWS/MemoryDB"
         metrics_df["Timestamp"] = pd.to_datetime(
             metrics_df["Timestamp"], utc=True
         ).dt.tz_localize(None)
@@ -263,7 +265,7 @@ class EcsDistributionReportTests(unittest.TestCase):
         expected = {
             "ECS Tasks — Network TX (KB/min)": "No Network TX Metrics",
             "ECS Tasks — Memory (MB)": "No ECS Memory Metrics",
-            "ElastiCache Memory Usage (%)": "No CloudWatch Metrics",
+            "MemoryDB Memory Usage (%)": "No CloudWatch Metrics",
             "ECS Task Latency (ms)": "No ECS task latency datapoints",
         }
         for title, expected_text in expected.items():

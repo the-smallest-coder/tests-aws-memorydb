@@ -1,7 +1,7 @@
 """WP3 tests 30-33: provenance (git SHA, engine_version_actual, pinned images)
 must be verified against an actual downloaded artifact, not HCL text -- a
 regex over the jsonencode() block would pass even if the real S3 object
-never carries these fields. See PLAN_2.md WP3.
+never carries these fields.
 """
 
 import json
@@ -24,15 +24,15 @@ GIT_SHA_SCRIPT = ROOT / "scripts" / "git_sha.sh"
 # WP0 + WP3 -- rich, with the new provenance fields populated.
 RICH_CLUSTER_DETAILS_WITH_PROVENANCE = {
     "run": {
-        "cluster_id": "elasticache-perf-test-valkey-20260810-al",
+        "cluster_id": "memorydb-perf-test-valkey-20260810-al",
         "git_sha": "abc123def456",
         "git_dirty": "false",
         "terraform_workspace": "default",
     },
-    "elasticache": {
+    "memorydb": {
         "engine": "valkey",
         "engine_version_configured": "7.1",
-        "engine_version_actual": "7.1.0",
+        "engine_patch_version": "7.2.0",
         "node_type": "cache.t4g.micro",
     },
     "ecs": {
@@ -56,7 +56,7 @@ class ClusterDetailsProvenanceFieldsTests(unittest.TestCase):
         config = _config_from_cluster_details(RICH_CLUSTER_DETAILS_WITH_PROVENANCE)
 
         self.assertEqual(config["git_sha"], "abc123def456")
-        self.assertEqual(config["engine_version_actual"], "7.1.0")
+        self.assertEqual(config["engine_version_actual"], "7.2.0")
         self.assertEqual(config["loadgen_image"], RICH_CLUSTER_DETAILS_WITH_PROVENANCE["ecs"]["loadgen_image"])
 
 
@@ -72,7 +72,7 @@ class EnrichSummaryMetaProvenanceTests(unittest.TestCase):
         enrich_summary_meta(summary, RICH_CLUSTER_DETAILS_WITH_PROVENANCE)
 
         self.assertEqual(summary["meta"]["engine_version"], "7.1")
-        self.assertEqual(summary["meta"]["engine_version_actual"], "7.1.0")
+        self.assertEqual(summary["meta"]["engine_version_actual"], "7.2.0")
         self.assertEqual(summary["meta"]["git_sha"], "abc123def456")
 
     def test_old_cluster_details_without_new_keys_does_not_raise_and_leaves_fields_absent(self):
@@ -83,7 +83,7 @@ class EnrichSummaryMetaProvenanceTests(unittest.TestCase):
 
         old_style_cluster_details = {
             "run": {"cluster_id": "cluster-a"},
-            "elasticache": {"engine": "valkey", "node_type": "cache.t4g.micro"},
+            "memorydb": {"engine": "valkey", "node_type": "cache.t4g.micro"},
         }
         summary = {"meta": {}}
 

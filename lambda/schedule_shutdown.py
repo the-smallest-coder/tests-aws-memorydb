@@ -1,6 +1,3 @@
-# UNPORTED — copied from tests-aws-elasticache-redis @ HEAD.
-# Still uses the elasticache boto3 client. See PLAN.md work package WP4.
-
 import html
 import os
 import re
@@ -34,7 +31,7 @@ def _ses_config():
     if "@" in identity:
         source_email = identity
     else:
-        source_email = f"aws-elasticache-lab@{identity}"
+        source_email = f"aws-memorydb-lab@{identity}"
     
     return {
         "client": boto3.client("ses", region_name=ses_region),
@@ -147,15 +144,15 @@ def handler(event, context):
     else:
         print("VERIFY_RULE_NAME not set; skipping verify scheduling.")
 
-    subject = f"[ElastiCache Test Started] {cluster_id or service}"
+    subject = f"[MemoryDB Test Started] {cluster_id or service}"
     body_text = (
-        f"ElastiCache performance test started.\n\n"
+        f"MemoryDB performance test started.\n\n"
         f"Cluster: {cluster_id or service}\n"
         f"Shutdown scheduled at: {shutdown_time.isoformat()}\n"
         f"Verify scheduled at: {verify_time.isoformat()}\n"
     )
 
-    engine_type = os.environ.get("ENGINE_TYPE", "redis").capitalize()
+    engine_type = os.environ.get("ENGINE_TYPE", "valkey").capitalize()
     engine_version = os.environ.get("ENGINE_VERSION", "")
     node_type = os.environ.get("NODE_TYPE", "")
     node_count = os.environ.get("NODE_COUNT", "")
@@ -232,7 +229,7 @@ def handler(event, context):
               </tr>
               <tr>
                 <td width="50%" style="padding:8px 0;">
-                  <span style="font-size:12px;color:#80868b;">Cache Nodes</span><br>
+                  <span style="font-size:12px;color:#80868b;">Nodes</span><br>
                   <span style="font-size:15px;color:#202124;font-weight:500;">{node_count_html}</span>
                 </td>
                 <td width="50%" style="padding:8px 0;">
@@ -294,7 +291,7 @@ def handler(event, context):
         <tr>
           <td style="background-color:#f8f9fa;padding:20px 40px;border-top:1px solid #e8eaed;">
             <p style="margin:0;font-size:12px;color:#80868b;text-align:center;">
-              Automated notification from ElastiCache Performance Lab&nbsp;&nbsp;&#8226;&nbsp;&nbsp;{aws_region_html}
+              Automated notification from MemoryDB Performance Lab&nbsp;&nbsp;&#8226;&nbsp;&nbsp;{aws_region_html}
             </p>
           </td>
         </tr>

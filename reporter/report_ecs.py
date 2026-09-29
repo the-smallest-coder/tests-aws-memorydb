@@ -6,6 +6,8 @@ from typing import Any
 
 from report_common import get_env_var
 
+import metric_source
+
 
 def validate_csv_columns(df: Any, csv_name: str) -> bool:
     required_columns = ["Timestamp", "Namespace", "Stat", "MetricName", "Value", "Dimensions"]
@@ -29,7 +31,13 @@ def read_csv_from_s3(s3_client: Any, bucket: str, key: str) -> Any:
         sys.exit(1)
 
 
-def parse_dimensions(dim_str: Any) -> str:
+def parse_dimensions(dim_str: Any, namespace: Any = None) -> str:
+    """Legend label for one metrics row.
+
+    MemoryDB's cluster dimension and ECS's are both called ClusterName, so the
+    dimension names alone cannot tell a MemoryDB row from an ECS one -- the
+    namespace has to. Without it every ECS row would be labelled as a node.
+    """
     if not isinstance(dim_str, str):
         return "Unknown"
 
@@ -42,10 +50,12 @@ def parse_dimensions(dim_str: Any) -> str:
     except Exception:
         return "Unknown"
 
-    if "CacheClusterId" in dims:
-        return f"Node: {dims['CacheClusterId']}"
-    if "ReplicationGroupId" in dims:
-        return f"Cluster: {dims['ReplicationGroupId']}"
+    if namespace == metric_source.NAMESPACE:
+        if metric_source.NODE_DIMENSION in dims:
+            return f"Node: {dims[metric_source.NODE_DIMENSION]}"
+        if metric_source.CLUSTER_DIMENSION in dims:
+            return f"Cluster: {dims[metric_source.CLUSTER_DIMENSION]}"
+        return "Global"
     if "ServiceName" in dims:
         return f"Service: {dims['ServiceName']}"
     if "ClusterName" in dims:
@@ -144,7 +154,7 @@ def generate_s3_html_report(
 <body>
     <div class="container">
         <header>
-            <h1>ElastiCache Performance Report</h1>
+            <h1>MemoryDB Performance Report</h1>
             <div class="meta">Cluster: {escaped_cluster_id} | Run ID: {escaped_timestamp}</div>
         </header>
         <section class="summary-grid">
@@ -166,6 +176,35 @@ def generate_s3_html_report(
 </body>
 </html>
 """
+
+
+#: Operation counters behind "Peak Ops/Sec" -- the same pair the main report
+#: sums for cache_efficiency.total_ops. The ElastiCache original queried
+#: CmdGet/CmdSet, which are Memcached metrics: they never matched a Redis or
+#: Valkey row, so this chart was always empty and its peak always read 0.
+OPS_METRICS = ("GetTypeCmds", "SetTypeCmds")
+
+
+def cluster_ops_per_sec(df: Any, cluster_id: str) -> Any:
+    """Cluster-wide operations per second, one value per minute.
+
+    Deduplicated like every other count in the reports: the cluster-level
+    row when MemoryDB publishes one, otherwise the sum of the node rows --
+    never both. CloudWatch Sums cover a 60-second period, hence the / 60.
+    """
+    import pandas as pd
+
+    from helpers import select_node_dimension_rows
+
+    rows = df[(df["Namespace"] == metric_source.NAMESPACE) & (df["Stat"] == "Sum")]
+    selected = [
+        select_node_dimension_rows(rows[rows["MetricName"] == name], cluster_id)
+        for name in OPS_METRICS
+    ]
+    selected = [frame for frame in selected if not frame.empty]
+    if not selected:
+        return pd.Series(dtype="float64")
+    return pd.concat(selected).groupby("Timestamp")["Value"].sum().sort_index() / 60.0
 
 
 def run_ecs_report() -> None:
@@ -202,34 +241,27 @@ def run_ecs_report() -> None:
     df = pd.concat(frames)
     df["Timestamp"] = pd.to_datetime(df["Timestamp"])
     df.sort_values("Timestamp", inplace=True)
-    df["Source"] = df["Dimensions"].apply(parse_dimensions)
+    df["Source"] = [
+        parse_dimensions(dimensions, namespace)
+        for dimensions, namespace in zip(df["Dimensions"], df["Namespace"])
+    ]
 
     summary_stats: list[dict[str, str]] = []
 
-    throughput_mask = (
-        (df["Namespace"] == "AWS/ElastiCache")
-        & (df["Stat"] == "Sum")
-        & (df["MetricName"].isin(["CmdSet", "CmdGet"]))
-    )
-    df_throughput = df[throughput_mask].copy()
+    ops_per_sec = cluster_ops_per_sec(df, cluster_id)
     fig_throughput = go.Figure()
-    max_ops = 0.0
-    for source in df_throughput["Source"].unique():
-        if "Cluster:" not in source and "Node:" not in source:
-            continue
-        subset = df_throughput[df_throughput["Source"] == source]
-        pivoted = subset.pivot_table(index="Timestamp", columns="MetricName", values="Value", aggfunc="sum").fillna(0)
-        pivoted["Total"] = pivoted.get("CmdGet", 0) + pivoted.get("CmdSet", 0)
-        pivoted["OpsSec"] = pivoted["Total"] / 60.0
-        current_max = pivoted["OpsSec"].max()
-        if pd.notna(current_max) and current_max > max_ops:
-            max_ops = float(current_max)
-        fig_throughput.add_trace(go.Scatter(x=pivoted.index, y=pivoted["OpsSec"], mode="lines", name=source))
+    if not ops_per_sec.empty:
+        fig_throughput.add_trace(
+            go.Scatter(x=ops_per_sec.index, y=ops_per_sec.values, mode="lines", name=f"Cluster: {cluster_id}")
+        )
     fig_throughput.update_layout(height=400, margin=dict(l=20, r=20, t=20, b=20))
-    summary_stats.append({"label": "Peak Ops/Sec", "value": f"{int(max_ops):,}"})
+    # "n/a", not 0, when there is no data: a zero here would read as a
+    # measured idle cluster rather than as missing metrics.
+    peak_ops = f"{int(ops_per_sec.max()):,}" if not ops_per_sec.empty else "n/a"
+    summary_stats.append({"label": "Peak Ops/Sec", "value": peak_ops})
 
     cpu_mask = (
-        (df["Namespace"] == "AWS/ElastiCache")
+        (df["Namespace"] == metric_source.NAMESPACE)
         & (df["Stat"] == "Average")
         & (df["MetricName"].isin(["EngineCPUUtilization", "CPUUtilization"]))
     )

@@ -1,33 +1,41 @@
-# =============================================================================
-# UNPORTED — copied verbatim from tests-aws-elasticache-redis @ HEAD.
-# This file still targets ElastiCache. See PLAN.md, work package WP1.
-# =============================================================================
-
 # AWS region (default: us-east-1 for cost optimization)
 aws_region = "us-east-1"
 
 # Project configuration
-project_name = "elasticache-perf-test"
+project_name = "memorydb-perf-test"
 
 # REQUIRED: Your existing VPC and subnets
-vpc_id     = "vpc-xxxxxxxxx"           # Replace with your VPC ID
+vpc_id     = "vpc-xxxxxxxxx"                   # Replace with your VPC ID
 subnet_ids = ["subnet-xxxxx", "subnet-yyyyy"]  # Replace with your subnet IDs
 
-# ElastiCache configuration
-engine_type           = "redis"         # Options: redis, valkey
-engine_version        = "7.1"
-node_type            = "cache.t4g.micro"  # Start with cheapest instance
-cluster_mode_enabled = false            # Set to true for cluster mode testing
+# MemoryDB configuration
+engine_type    = "valkey"  # Options: redis, valkey. Valkey 7.2+ is required for
+                           # SuccessfulReadRequestLatency / SuccessfulWriteRequestLatency;
+                           # on Redis OSS those metrics do not exist at all.
+engine_version = "7.2"
+node_type      = "db.r6g.large"  # There is no db.t4g.micro; db.t4g.small is the
+                                 # smallest MemoryDB offers. The node type must be
+                                 # present in local._node_memory_bytes (ecs.tf).
 
-# Non-cluster mode settings
-num_cache_nodes = 1                     # Number of nodes (1 = single node, 2+ = primary + replicas)
-# elasticache_availability_zone = "us-east-1a"  # Pin the node's AZ (single-node, non-cluster-mode only). Empty = let AWS choose.
+# Topology. MemoryDB is always sharded: one shard is still a cluster, and every
+# client must be cluster-aware. Nodes billed = num_shards * (num_replicas_per_shard + 1),
+# so the values below are a single node -- comparable with single-node
+# ElastiCache runs. MemoryDB's own API default would be 1 replica (2 nodes).
+num_shards             = 1
+num_replicas_per_shard = 0  # 1+ adds replicas (and the replication panels).
 
-# Cluster mode settings (only used when cluster_mode_enabled = true)
-num_node_groups         = 1             # Number of shards
-replicas_per_node_group = 0             # Replicas per shard
+# Security. Encryption at rest is always on and multi-AZ is unconditional, so
+# neither is configurable. TLS defaults to true and the load generator passes
+# --tls to match; turning it off forces acl_name = "open-access".
+acl_name    = "open-access"
+tls_enabled = true
+# kms_key_arn = "arn:aws:kms:us-east-1:123456789012:key/..."  # Customer-managed key; empty uses the AWS-owned key
 
-# Network and security
+# Data tiering (SSD-backed). Only valid on db.r6gd.* node types and fixed at
+# create time. Adds the Tier dimension and the disk metric family.
+data_tiering = false
+
+# Network
 port = 6379
 # allowed_cidr_blocks = ["10.0.0.0/16"]  # Uncomment to restrict access, defaults to VPC CIDR
 
@@ -38,18 +46,14 @@ port = 6379
 # }
 
 # Backup and maintenance
-snapshot_retention_limit = 0            # Disable snapshots for testing
-automatic_failover_enabled = false      # Set to true for multi-node with automatic failover
+snapshot_retention_limit = 0  # Disable snapshots for testing
 
-# Security (optional for testing)
-at_rest_encryption_enabled = false
-transit_encryption_enabled = false
-# auth_token = "your-secret-token"      # Uncomment if transit_encryption_enabled = true
-
-# CloudWatch
+# CloudWatch. No log-delivery settings: MemoryDB has no slow-log or engine-log
+# export equivalent, so cloudwatch_log_retention_days covers only the ECS,
+# Lambda and Container Insights groups this project creates itself.
 cloudwatch_log_retention_days = 7
 enable_cloudwatch_dashboard   = true
-ecs_container_insights_mode  = "enhanced"  # Required for task-level metrics (extra cost)
+ecs_container_insights_mode   = "enhanced"  # Required for task-level metrics (extra cost)
 
 # Additional tags (optional)
 tags = {
@@ -58,23 +62,28 @@ tags = {
 }
 
 # Load Generator Configuration
-loadgen_task_count        = 1      # Number of ECS tasks (scale for more load)
-loadgen_memtier_test_time = 0      # 0 = run until ECS stops the task
+loadgen_task_count        = 1  # Number of ECS tasks (scale for more load)
+loadgen_memtier_test_time = 0  # 0 = run until ECS stops the task
 # loadgen_assign_public_ip = false  # Workaround for no NAT/egress; not recommended
 
 # memtier_benchmark defaults (minimal config, scale up as needed)
 # loadgen_memtier_threads   = 1
 # loadgen_memtier_clients   = 1
-# loadgen_memtier_pipeline  = 1
+# loadgen_memtier_pipeline  = 1   # Pipelining inflates the server-side latency
+#                                 # metrics. Pin to 1 for any run whose purpose is
+#                                 # server latency, or treat those figures as
+#                                 # untrustworthy for that run.
 # loadgen_memtier_data_size = 32
-# loadgen_memtier_ratio     = "1:10"
+# loadgen_memtier_ratio     = "1:10"  # SET:GET. MemoryDB commits every write to a
+#                                     # multi-AZ transaction log, so the write share
+#                                     # drives both latency and the data-written cost term.
 # loadgen_memtier_key_maximum = 0   # 0 = auto-compute based on node type (~85% fill); >0 = explicit per-task key count with unique prefixes
 
 # REQUIRED: Metrics Export Configuration
-metrics_export_s3_bucket = "my-elasticache-perf-exports"  # REQUIRED - create bucket first!
-metrics_export_s3_prefix = "exports/"                      # Optional, default: exports/
-test_duration_minutes    = 60                              # Minutes before auto-shutdown
+metrics_export_s3_bucket = "my-memorydb-perf-exports"  # REQUIRED - create bucket first!
+metrics_export_s3_prefix = "exports/"                  # Optional, default: exports/
+test_duration_minutes    = 60                          # Minutes before auto-shutdown
 
 # Email Notification (optional)
-# notification_email           = "your-email@example.com"                              # Recipient email
+# notification_email            = "your-email@example.com"                                   # Recipient email
 # notification_ses_identity_arn = "arn:aws:ses:us-east-1:123456789012:identity/example.com"  # SES verified domain ARN

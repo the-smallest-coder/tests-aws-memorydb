@@ -1,11 +1,11 @@
 """
-Fetch ElastiCache CacheClusterId-dimension metrics missing from the existing CSV
-and append them to it.
+Fetch cluster-dimension MemoryDB metrics missing from an existing CSV and
+append them to it.
 
 Usage:
     python reporter/fetch_missing_metrics.py \
-        --csv results/20260227-140039/metrics/elasticache-perf-test-redis-27125324.csv \
-        --cluster-id elasticache-perf-test-redis-27125324-001 \
+        --csv results/20260227-140039/metrics/memorydb-perf-test-valkey-27125324.csv \
+        --cluster-name memorydb-perf-test-valkey-27125324 \
         --start 2026-02-27T12:57:00 \
         --end   2026-02-27T13:59:00
 """
@@ -16,26 +16,29 @@ import csv
 import sys
 from datetime import datetime, timezone
 
+import metric_source
+
 STATISTICS = ['Average', 'Sum', 'Maximum', 'Minimum']
-NAMESPACE   = 'AWS/ElastiCache'
+NAMESPACE   = metric_source.NAMESPACE
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--csv',        required=True,  help='Path to existing metrics CSV')
-    parser.add_argument('--cluster-id', required=True,  help='CacheClusterId value (e.g. …-001)')
+    parser.add_argument('--cluster-name', required=True,
+                        help='MemoryDB ClusterName value (the cluster, not a node)')
     parser.add_argument('--start',      required=True,  help='ISO start time UTC (e.g. 2026-02-27T12:57:00)')
     parser.add_argument('--end',        required=True,  help='ISO end time UTC (e.g. 2026-02-27T13:59:00)')
     args = parser.parse_args()
 
     start_time = datetime.fromisoformat(args.start).replace(tzinfo=timezone.utc)
     end_time   = datetime.fromisoformat(args.end).replace(tzinfo=timezone.utc)
-    dimensions = [{'Name': 'CacheClusterId', 'Value': args.cluster_id}]
-    dims_str   = f'CacheClusterId={args.cluster_id}'
+    dimensions = [{'Name': metric_source.CLUSTER_DIMENSION, 'Value': args.cluster_name}]
+    dims_str   = metric_source.cluster_dim(args.cluster_name)
 
     cw = boto3.client('cloudwatch')
 
-    # List all metrics for this CacheClusterId
+    # List all metrics published at this cluster dimension
     metric_names = []
     paginator = cw.get_paginator('list_metrics')
     for page in paginator.paginate(Namespace=NAMESPACE, Dimensions=dimensions):

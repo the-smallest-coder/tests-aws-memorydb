@@ -1,8 +1,3 @@
-# =============================================================================
-# UNPORTED — copied verbatim from tests-aws-elasticache-redis @ HEAD.
-# This file still targets ElastiCache. See PLAN.md, work package WP4.
-# =============================================================================
-
 # Lambda function for shutdown orchestration
 data "archive_file" "shutdown_lambda" {
   type        = "zip"
@@ -44,10 +39,10 @@ resource "aws_lambda_function" "shutdown" {
 
   environment {
     variables = {
-      CLUSTER_ID     = local.cluster_id
-      ECS_CLUSTER    = local.loadgen_cluster_name
-      ECS_SERVICE    = local.loadgen_service_name
-      ELASTICACHE_ID = aws_elasticache_replication_group.main.id
+      CLUSTER_ID            = local.cluster_id
+      ECS_CLUSTER           = local.loadgen_cluster_name
+      ECS_SERVICE           = local.loadgen_service_name
+      MEMORYDB_CLUSTER_NAME = aws_memorydb_cluster.main.name
     }
   }
 
@@ -83,8 +78,7 @@ resource "aws_lambda_function" "shutdown_scheduler" {
       ENGINE_TYPE               = var.engine_type
       ENGINE_VERSION            = var.engine_version
       NODE_TYPE                 = var.node_type
-      NODE_COUNT                = tostring(var.cluster_mode_enabled ? var.num_node_groups : var.num_cache_nodes)
-      CLUSTER_MODE              = tostring(var.cluster_mode_enabled)
+      NODE_COUNT                = tostring(local.memorydb_node_count)
       LOADGEN_TASK_COUNT        = tostring(var.loadgen_task_count)
       AWS_REGION_NAME           = var.aws_region
     }
@@ -112,7 +106,7 @@ resource "aws_lambda_function" "shutdown_verify" {
       CLUSTER_ID                   = local.cluster_id
       ECS_CLUSTER                  = local.loadgen_cluster_name
       ECS_SERVICE                  = local.loadgen_service_name
-      ELASTICACHE_ID               = aws_elasticache_replication_group.main.id
+      MEMORYDB_CLUSTER_NAME        = aws_memorydb_cluster.main.name
       S3_BUCKET                    = var.metrics_export_s3_bucket
       S3_PREFIX                    = var.metrics_export_s3_prefix
       RUN_FOLDER                   = local.run_folder
@@ -120,13 +114,11 @@ resource "aws_lambda_function" "shutdown_verify" {
       LOG_GROUP                    = aws_cloudwatch_log_group.loadgen.name
       LOADGEN_LOG_GROUP            = aws_cloudwatch_log_group.loadgen.name
       CONTAINER_INSIGHTS_LOG_GROUP = aws_cloudwatch_log_group.container_insights.name
-      ELASTICACHE_LOG_GROUP        = aws_cloudwatch_log_group.elasticache.name
       LAMBDA_SCHEDULER_LOG_GROUP   = aws_cloudwatch_log_group.lambda_shutdown_scheduler.name
       TEST_DURATION_MINUTES        = var.test_duration_minutes
-      CLUSTER_MODE                 = tostring(var.cluster_mode_enabled)
-      NUM_CACHE_NODES              = tostring(var.num_cache_nodes)
-      NUM_NODE_GROUPS              = tostring(var.num_node_groups)
-      REPLICAS_PER_NODE_GROUP      = tostring(var.replicas_per_node_group)
+      NUM_NODES                    = tostring(local.memorydb_node_count)
+      NUM_SHARDS                   = tostring(var.num_shards)
+      NUM_REPLICAS_PER_SHARD       = tostring(var.num_replicas_per_shard)
       NOTIFICATION_EMAIL           = var.notification_email
       SES_IDENTITY_ARN             = var.notification_ses_identity_arn
       ENGINE_TYPE                  = var.engine_type
@@ -136,7 +128,7 @@ resource "aws_lambda_function" "shutdown_verify" {
       NODE_HOURLY_USD              = local._node_hourly_usd != null ? tostring(local._node_hourly_usd) : ""
       NODE_HOURLY_USD_SOURCE       = local._node_hourly_usd_source
       NODE_HOURLY_USD_REASON       = local._node_hourly_usd_reason
-      NODE_COUNT                   = tostring(var.cluster_mode_enabled ? var.num_node_groups : var.num_cache_nodes)
+      NODE_COUNT                   = tostring(local.memorydb_node_count)
       AWS_REGION_NAME              = var.aws_region
       REPORTER_TASK_DEFINITION     = aws_ecs_task_definition.reporter.arn
     }
@@ -269,9 +261,9 @@ resource "aws_iam_role_policy" "lambda_shutdown_policy" {
       {
         Effect = "Allow"
         Action = [
-          "elasticache:DeleteReplicationGroup"
+          "memorydb:DeleteCluster"
         ]
-        Resource = aws_elasticache_replication_group.main.arn
+        Resource = aws_memorydb_cluster.main.arn
       }
     ]
   })
@@ -380,7 +372,7 @@ resource "aws_iam_role_policy" "lambda_shutdown_verify_policy" {
       {
         Effect = "Allow"
         Action = [
-          "elasticache:DescribeReplicationGroups"
+          "memorydb:DescribeClusters"
         ]
         Resource = "*"
       },

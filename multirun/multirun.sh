@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Small Terraform workspace helper for disposable ElastiCache performance runs.
+# Small Terraform workspace helper for disposable MemoryDB performance runs.
 
 set -euo pipefail
 
@@ -432,7 +432,9 @@ cmd_apply() {
     mkdir -p "$PLUGIN_CACHE_DIR"
     local tfvars="multirun/runs/${name}.tfvars"
     trap restore_default_workspace EXIT
-    TF_PLUGIN_CACHE_DIR="$PLUGIN_CACHE_DIR" terraform -chdir="$REPO_ROOT" init -input=false
+    # -upgrade: take the newest provider releases every run instead of the
+    # versions an earlier init wrote into .terraform.lock.hcl (see versions.tf).
+    TF_PLUGIN_CACHE_DIR="$PLUGIN_CACHE_DIR" terraform -chdir="$REPO_ROOT" init -input=false -upgrade
     select_or_create_workspace "$name"
     if ! state_is_empty; then
         die "workspace '$name' already has Terraform state; destroy first"

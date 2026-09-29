@@ -167,7 +167,7 @@ def render_html(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ElastiCache Report — {escaped_cluster_id}</title>
+  <title>MemoryDB Report — {escaped_cluster_id}</title>
   <style>
 {_SINGLE_CSS}  </style>
 </head>
@@ -175,7 +175,7 @@ def render_html(
 
 {_SINGLE_COPY_BUTTON}
 <div class="page-header">
-  <h1>ElastiCache Performance Report</h1>
+  <h1>MemoryDB Performance Report</h1>
   <div class="meta">{meta_line}</div>
   {pills_html}
 </div>
@@ -201,7 +201,7 @@ def render_html(
 
   <div class="chart-group">
     <div class="group-header">
-      <h2>ElastiCache Deep-Dive</h2>
+      <h2>MemoryDB Deep-Dive</h2>
       <span class="group-badge deepdive">report window</span>
     </div>
     <div class="chart-wrap">{chart_deep_dive_html}</div>
@@ -892,7 +892,7 @@ def render_aggregate_report(payload: dict[str, object]) -> str:
 
     <section class="panel">
       <h2>Cost per successful operation</h2>
-      <p class="sub">ElastiCache node hourly rate only (D11) -- never Fargate, network, or CloudWatch cost.</p>
+      <p class="sub">MemoryDB node-hours only -- never Fargate, network, CloudWatch, or the per-GB data-written charge (WP8).</p>
       {cost_stats_html}
       <table>
         <thead><tr><th>Run</th><th>USD / successful op</th></tr></thead>

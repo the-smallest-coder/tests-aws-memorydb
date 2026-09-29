@@ -1,8 +1,3 @@
-# =============================================================================
-# UNPORTED — copied verbatim from tests-aws-elasticache-redis @ HEAD.
-# This file still targets ElastiCache. See PLAN.md, work package WP2 + WP9.
-# =============================================================================
-
 # ---------------------------------------------------------------------------
 # cluster_details.json — uploaded to S3 immediately after terraform apply.
 #
@@ -28,7 +23,7 @@ resource "aws_s3_object" "cluster_details" {
       cluster_id           = local.cluster_id
       aws_region           = var.aws_region
       run_id_discriminator = var.run_id_discriminator
-      # WP3 provenance (PLAN_2.md). git_sha.sh always exits 0; "unknown"
+      # Run provenance. git_sha.sh always exits 0; "unknown"
       # means it couldn't determine one, not that provenance is unavailable
       # by design -- see the exit-condition table (git_sha == "unknown" at
       # apply from a git repo is a regression, not an expected state).
@@ -37,40 +32,82 @@ resource "aws_s3_object" "cluster_details" {
       terraform_workspace = terraform.workspace
     }
 
-    # ----- ElastiCache configuration (as applied) -----
-    elasticache = {
+    # ----- MemoryDB configuration (as applied) -----
+    memorydb = {
       engine                    = var.engine_type
       engine_version_configured = var.engine_version
-      # The requested version can be a loose "7.1"; this is what actually
-      # came up ("7.1.0"). engine_version_configured is left untouched above
-      # -- the two carry different information and neither replaces the other.
-      engine_version_actual      = aws_elasticache_replication_group.main.engine_version_actual
-      node_type                  = var.node_type
-      availability_zone          = local.elasticache_pinned_az
-      node_memory_bytes          = lookup(local._node_memory_bytes, var.node_type, 0)
-      node_hourly_usd            = local._node_hourly_usd
-      node_hourly_usd_source     = local._node_hourly_usd_source
-      node_hourly_usd_reason     = local._node_hourly_usd_reason
-      cluster_mode_enabled       = var.cluster_mode_enabled
-      num_cache_nodes            = var.cluster_mode_enabled ? null : var.num_cache_nodes
-      num_node_groups            = var.cluster_mode_enabled ? var.num_node_groups : null
-      replicas_per_node_group    = var.cluster_mode_enabled ? var.replicas_per_node_group : null
-      automatic_failover_enabled = var.automatic_failover_enabled
-      multi_az_enabled           = var.automatic_failover_enabled
-      at_rest_encryption_enabled = var.at_rest_encryption_enabled
-      transit_encryption_enabled = var.transit_encryption_enabled
-      port                       = var.port
-      parameter_group_name       = length(var.parameter_group_settings) > 0 ? aws_elasticache_parameter_group.main[0].name : "default.${local.parameter_group_family}"
-      parameter_group_settings   = var.parameter_group_settings
-      snapshot_retention_limit   = var.snapshot_retention_limit
-      maintenance_window         = var.maintenance_window
-      cloudwatch_log_group       = aws_cloudwatch_log_group.elasticache.name
+      # The requested version can be a loose "7.2"; this is the patch level
+      # that actually came up. engine_version_configured is left untouched
+      # above -- the two carry different information and neither replaces
+      # the other.
+      engine_patch_version = aws_memorydb_cluster.main.engine_patch_version
+      node_type            = var.node_type
+      # Direct index, not lookup(..., 0): an unknown node type must fail the
+      # apply, not silently record a zero-byte node and corrupt every
+      # keyspace and cost figure derived from it. main.tf carries the
+      # precondition that names the supported set.
+      node_memory_bytes      = local._node_memory_bytes[var.node_type]
+      node_hourly_usd        = local._node_hourly_usd
+      node_hourly_usd_source = local._node_hourly_usd_source
+      node_hourly_usd_reason = local._node_hourly_usd_reason
 
-      # Live endpoints (resolved after cluster is created)
-      primary_endpoint       = var.cluster_mode_enabled ? null : aws_elasticache_replication_group.main.primary_endpoint_address
-      reader_endpoint        = var.cluster_mode_enabled ? null : aws_elasticache_replication_group.main.reader_endpoint_address
-      configuration_endpoint = var.cluster_mode_enabled ? aws_elasticache_replication_group.main.configuration_endpoint_address : null
-      replication_group_arn  = aws_elasticache_replication_group.main.arn
+      # Topology. MemoryDB is always sharded, so there is no cluster-mode
+      # flag and no non-cluster branch. node_count is what gets billed.
+      num_shards             = var.num_shards
+      num_replicas_per_shard = var.num_replicas_per_shard
+      node_count             = local.memorydb_node_count
+
+      # Security. Encryption at rest and multi-AZ are unconditional on
+      # MemoryDB and therefore not recorded as choices; kms_key_arn records
+      # whether a customer-managed key replaced the AWS-owned default.
+      acl_name     = var.acl_name
+      tls_enabled  = var.tls_enabled
+      kms_key_arn  = var.kms_key_arn
+      data_tiering = var.data_tiering
+
+      port                     = var.port
+      parameter_group_name     = length(var.parameter_group_settings) > 0 ? aws_memorydb_parameter_group.main[0].name : local.default_parameter_group_name
+      parameter_group_family   = local.parameter_group_family
+      parameter_group_settings = var.parameter_group_settings
+      snapshot_retention_limit = var.snapshot_retention_limit
+      maintenance_window       = var.maintenance_window
+
+      # No cloudwatch_log_group: MemoryDB has no log-delivery configuration,
+      # so there is no slow-log or engine-log destination to record.
+
+      # Live endpoint (resolved after the cluster is created). MemoryDB
+      # publishes one cluster endpoint -- no primary/reader/configuration
+      # trio -- because every client is cluster-aware by necessity.
+      cluster_endpoint = aws_memorydb_cluster.main.cluster_endpoint[0].address
+      cluster_arn      = aws_memorydb_cluster.main.arn
+    }
+
+    # ----- Observed placement -----
+    # MemoryDB has no availability-zone argument: placement is chosen by AWS
+    # and can only be observed after the fact. Recording it per node is what
+    # replaces the AZ pinning the source project used for reproducibility --
+    # two runs of the same config stay *checkable* for comparability even
+    # though placement is not *controllable*.
+    placement = {
+      shards = [
+        for shard in aws_memorydb_cluster.main.shards : {
+          name      = shard.name
+          num_nodes = shard.num_nodes
+          slots     = shard.slots
+          nodes = [
+            for node in shard.nodes : {
+              name              = node.name
+              availability_zone = node.availability_zone
+              endpoint_address  = try(node.endpoint[0].address, null)
+            }
+          ]
+        }
+      ]
+      availability_zones = distinct(sort(flatten([
+        for shard in aws_memorydb_cluster.main.shards : [
+          for node in shard.nodes : node.availability_zone
+        ]
+      ])))
     }
 
     # ----- memtier_benchmark configuration -----
@@ -92,8 +129,11 @@ resource "aws_s3_object" "cluster_details" {
       }
       test_time_seconds = local.memtier_test_time_seconds
       duration_label    = local.memtier_duration_label
-      tls               = var.transit_encryption_enabled
-      cluster_mode      = var.cluster_mode_enabled
+      tls               = var.tls_enabled
+      # Always true and not a variable: MemoryDB has no non-cluster mode, so
+      # memtier always runs with --cluster-mode. Recorded so a reader of this
+      # file does not have to know that to interpret the run.
+      cluster_mode = true
     }
 
     # ----- ECS load generator resources -----
@@ -132,5 +172,5 @@ resource "aws_s3_object" "cluster_details" {
     RunFolder = local.run_folder
   }
 
-  depends_on = [aws_elasticache_replication_group.main]
+  depends_on = [aws_memorydb_cluster.main]
 }

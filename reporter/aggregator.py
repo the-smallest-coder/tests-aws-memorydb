@@ -1,6 +1,6 @@
 """Group repeated runs by control-variable fingerprint; report per-metric
-n/median/mean/CV%/min/max, and the ElastiCache-node-only cost per successful
-operation. See PLAN_2.md WP6.
+n/median/mean/CV%/min/max, and the MemoryDB-node-hours-only cost per successful
+operation.
 
 Never writes into a run's own results/<run-folder>/ (D9): output goes to a
 sibling results/aggregates/ directory, modeled on the existing
@@ -79,7 +79,7 @@ def group_runs(runs: list[RunData]) -> tuple[dict[str, dict[str, Any]], list[dic
 
 def _cv_pct(values: list[float]) -> float | None:
     """Sample stdev (ddof=1), matching benchmark.cv_pct's pandas.Series.std()
-    default -- population stdev would disagree by 13% at n=4 (PLAN_2.md WP6)."""
+    default -- population stdev would disagree by 13% at n=4."""
     import pandas as pd
 
     series = pd.Series(values, dtype="float64")
@@ -148,9 +148,9 @@ def _as_int_or_none(value: Any) -> int | None:
 
 
 def cost_per_successful_operation(run: RunData) -> dict[str, Any]:
-    """D11: the ONLY money anywhere in this plan -- the ElastiCache node's
+    """The only money anywhere in this plan -- the MemoryDB node's
     own hourly rate for its (node_type, engine, region). Never Fargate task
-    cost, network transfer, or CloudWatch: the test measures ElastiCache: the
+    cost, network transfer, or CloudWatch: the test measures MemoryDB: the
     bill for the instrument doing the measuring is out of scope.
 
     Computed at render time, never stored in results_local.json: the price
@@ -175,7 +175,7 @@ def cost_per_successful_operation(run: RunData) -> dict[str, Any]:
     # No fallback to meta.redis_hourly_usd (D11): that key's values come
     # from a removed hardcoded, Redis-only, us-east-1 price table -- present
     # and non-empty in 42 of 81 historical reports, and every one of those
-    # 42 is a Valkey run (tests/test_elasticache_node_catalog.py:75-89 guards
+    # 42 is a Valkey run (tests/test_memorydb_node_catalog.py guards
     # the table's removal, but only checks ecs.tf's text; it would not catch
     # a Python fallback silently resurrecting the same defect under a
     # different name). "n/a" for the whole history is the honest answer

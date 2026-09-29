@@ -4,7 +4,7 @@ import json
 
 from helpers import (
     metric_filter,
-    cache_hit_rate_df,
+    keyspace_hit_rate_df,
     client_latency_series,
     select_mem_dims,
     select_node_dimension_rows,
@@ -13,6 +13,8 @@ from helpers import (
 )
 from report_common import GENERATOR_SCHEMA_VERSION
 from loadgen_analysis import build_loadgen_summary
+
+import metric_source
 
 
 def _reporter_packages_dict(value):
@@ -31,10 +33,10 @@ def _reporter_packages_dict(value):
 
 
 def _dedup_metric_rows(df, metric_name, cluster_id, stat='Sum'):
-    """Rows for one metric/stat, deduplicated across the CacheClusterId /
-    CacheNodeId dimension axis (D6). Every field below that sums or counts
+    """Rows for one metric/stat, deduplicated across the cluster/node
+    dimension axis (ClusterName vs ClusterName+NodeName, D6). Every field below that sums or counts
     metrics_df rows goes through this, not a raw metric_filter() call."""
-    sub = metric_filter(df, metric_name, stat, 'CacheClusterId')
+    sub = metric_filter(df, metric_name, stat, metric_source.CLUSTER_DIMENSION)
     return select_node_dimension_rows(sub, cluster_id)
 
 
@@ -51,7 +53,7 @@ def _network_kib_per_sec(df, metric_name, cluster_id):
     that 60s bucket, not a byte count that only needs a KiB conversion. The
     previous code divided by 1024 alone (KiB, correctly named) but not by 60,
     so every value was 60x too high; it also summed cluster- and node-level
-    duplicate rows first, doubling that again. See PLAN_2.md WP1 step 2.
+    duplicate rows first, doubling that again.
     """
     selected = _dedup_metric_rows(df, metric_name, cluster_id)
     if selected.empty:
@@ -65,8 +67,8 @@ def _dedup_metric_stat(df, metric_name, cluster_id, stat, agg='mean'):
 
     Covers CloudWatch's ordinary Statistics (Average, Maximum, ...) and its
     ExtendedStatistics percentile rows alike (WP2 requests p99 for every
-    discovered metric) -- both duplicate across the CacheClusterId /
-    CacheNodeId axis the same way, so both need the same dedup.
+    discovered metric) -- both duplicate across the ClusterName /
+    ClusterName+NodeName axis the same way, so both need the same dedup.
     """
     if agg not in ('mean', 'max'):
         raise ValueError(f"_dedup_metric_stat: unsupported agg {agg!r}, expected 'mean' or 'max'")
@@ -97,28 +99,15 @@ def _percentile(series, pct):
         return None
 
 
-def _metric_agg(df, metric_name, stat, dim_prefix=None):
-    """Return {avg, min, max, p95, p99} for a metric over its entire time window."""
-    sub = metric_filter(df, metric_name, stat, dim_prefix)
-    if sub.empty:
-        return None
-    vals = sub['Value']
-    return {
-        'avg': _safe(float(vals.mean()), 3),
-        'min': _safe(float(vals.min()), 3),
-        'max': _safe(float(vals.max()), 3),
-        'p95': _percentile(vals, 95),
-        'p99': _percentile(vals, 99),
-    }
-
-
 def build_summary(metrics_df, memtier_minute_df, memtier_totals_df, ecs_df, extra_stats, config, cluster_id, time_range):
     """Return a fully-populated summary dict ready for json.dumps().
 
     Schema
     ------
     {
-      "meta": { cluster_id, time_range, engine_type, engine_version, node_type, node_count, cluster_mode },
+      "meta": { cluster_id, time_range, engine_type, engine_version, node_type, node_count,
+                cluster_mode },
+      "memorydb": { num_shards, num_replicas_per_shard },
       "benchmark": { avg_ops, peak_ops, cv_pct, avg_latency_ms, max_latency_ms,
                      total_bandwidth_kbs },
       "cache_efficiency": { avg_hit_rate_pct, total_evictions, min_freeable_memory_mb, peak_key_count,
@@ -130,9 +119,10 @@ def build_summary(metrics_df, memtier_minute_df, memtier_totals_df, ecs_df, extr
           "cache": { out_kib_per_sec, in_kib_per_sec },
           "throttling": { bw_in_exceeded_count, bw_out_exceeded_count, pps_exceeded_count }
       },
-      "latency_server_us": { get_avg, set_avg, string_avg, percentile_basis },
+      "latency_server_us": { get_avg, set_avg, string_avg, percentile_basis },  # always {} on MemoryDB
+      "server_request_latency_us": { read_avg, read_p99, write_avg, write_p99, percentile_basis },
       "client_latency": {
-          # ElastiCache/LoadGenerator EMF, minute-granularity, averaged across
+          # MemoryDB/LoadGenerator EMF, minute-granularity, averaged across
           # tasks then across minutes -- an average of percentiles, not one:
           p50_ms, p99_ms, p999_ms, worst_p99_ms, worst_p999_ms, percentile_basis,
           # memtier's own per-task Totals histogram, one aggregation
@@ -163,7 +153,10 @@ def build_summary(metrics_df, memtier_minute_df, memtier_totals_df, ecs_df, extr
         'node_hourly_usd_source': config.get('node_hourly_usd_source', ''),
         'node_hourly_usd_reason': config.get('node_hourly_usd_reason', ''),
         'node_count':      config.get('node_count', ''),
-        'cluster_mode':    str(config.get('cluster_mode', 'false')).lower(),
+        # Kept for schema-v4 consumers, and always "true": MemoryDB has no
+        # non-cluster mode. The shard/replica topology is MemoryDB-only and
+        # lives under the top-level "memorydb" key instead of here.
+        'cluster_mode':    'true',
         'generator_schema_version': GENERATOR_SCHEMA_VERSION,
         'source_mode': extra_stats.get('source_mode', ''),
         'memtier_window_source': extra_stats.get('memtier_window_source', 'memtier_log_messages'),
@@ -210,7 +203,7 @@ def build_summary(metrics_df, memtier_minute_df, memtier_totals_df, ecs_df, extr
     cache_efficiency = {}
     if not metrics_df.empty:
         # Hit rate
-        hr_df = cache_hit_rate_df(metrics_df)
+        hr_df = keyspace_hit_rate_df(metrics_df)
         if not hr_df.empty:
             avg_hr = float(hr_df['Value'].mean())
             cache_efficiency['avg_hit_rate_pct'] = _safe(avg_hr, 2)
@@ -221,13 +214,13 @@ def build_summary(metrics_df, memtier_minute_df, memtier_totals_df, ecs_df, extr
             cache_efficiency['total_evictions'] = int(ev_df['Value'].sum())
 
         # FreeableMemory min (in MB)
-        free_df = metric_filter(metrics_df, 'FreeableMemory', 'Minimum', 'CacheClusterId')
+        free_df = metric_filter(metrics_df, 'FreeableMemory', 'Minimum', metric_source.CLUSTER_DIMENSION)
         if not free_df.empty:
             cache_efficiency['min_freeable_memory_mb'] = _safe(
                 float(free_df['Value'].min()) / (1024 * 1024), 1)
 
         # Peak key count
-        items_df = metric_filter(metrics_df, 'CurrItems', 'Maximum', 'CacheClusterId')
+        items_df = metric_filter(metrics_df, 'CurrItems', 'Maximum', metric_source.CLUSTER_DIMENSION)
         if not items_df.empty:
             cache_efficiency['peak_key_count'] = int(items_df['Value'].max())
 
@@ -258,17 +251,17 @@ def build_summary(metrics_df, memtier_minute_df, memtier_totals_df, ecs_df, extr
     # ------------------------------------------------------------------ #
     engine_cpu = {}
     if not metrics_df.empty:
-        eng = metric_filter(metrics_df, 'EngineCPUUtilization', 'Average', 'CacheClusterId')
+        eng = metric_filter(metrics_df, 'EngineCPUUtilization', 'Average', metric_source.CLUSTER_DIMENSION)
         if not eng.empty:
             engine_cpu['avg_pct'] = _safe(float(eng['Value'].mean()), 2)
             engine_cpu['max_pct'] = _safe(float(eng['Value'].max()), 2)
 
-        bal = metric_filter(metrics_df, 'CPUCreditBalance', 'Average', 'CacheClusterId')
+        bal = metric_filter(metrics_df, 'CPUCreditBalance', 'Average', metric_source.CLUSTER_DIMENSION)
         if not bal.empty:
             engine_cpu['credit_balance_avg'] = _safe(float(bal['Value'].mean()), 2)
             engine_cpu['credit_balance_min'] = _safe(float(bal['Value'].min()), 2)
 
-        use = metric_filter(metrics_df, 'CPUCreditUsage', 'Average', 'CacheClusterId')
+        use = metric_filter(metrics_df, 'CPUCreditUsage', 'Average', metric_source.CLUSTER_DIMENSION)
         if not use.empty:
             engine_cpu['credit_usage_avg'] = _safe(float(use['Value'].mean()), 4)
 
@@ -277,8 +270,14 @@ def build_summary(metrics_df, memtier_minute_df, memtier_totals_df, ecs_df, extr
     # ------------------------------------------------------------------ #
     memory = {}
     if not metrics_df.empty:
-        for mname in ('DatabaseMemoryUsageCountedForEvictPercentage',
-                      'DatabaseCapacityUsageCountedForEvictPercentage'):
+        # MemoryDB publishes DatabaseMemoryUsagePercentage and
+        # DatabaseCapacityUsagePercentage, but not the *CountedForEvict
+        # variants the ElastiCache project preferred. Those two were the
+        # eviction-aware figures; without them this is plain memory usage, so
+        # the "headroom" it yields is against total memory, not against the
+        # eviction threshold.
+        for mname in ('DatabaseMemoryUsagePercentage',
+                      'DatabaseCapacityUsagePercentage'):
             mem_df = metric_filter(metrics_df, mname, 'Average')
             if not mem_df.empty:
                 nc = config.get('node_count', 1)
@@ -290,20 +289,20 @@ def build_summary(metrics_df, memtier_minute_df, memtier_totals_df, ecs_df, extr
                 memory['headroom_pct']    = _safe(100.0 - max_v, 2)
                 break
 
-        frag = metric_filter(metrics_df, 'MemoryFragmentationRatio', 'Average', 'CacheClusterId')
+        frag = metric_filter(metrics_df, 'MemoryFragmentationRatio', 'Average', metric_source.CLUSTER_DIMENSION)
         if not frag.empty:
             memory['fragmentation_avg'] = _safe(float(frag['Value'].mean()), 3)
             memory['fragmentation_max'] = _safe(float(frag['Value'].max()), 3)
 
-        swap = metric_filter(metrics_df, 'SwapUsage', 'Maximum', 'CacheClusterId')
+        swap = metric_filter(metrics_df, 'SwapUsage', 'Maximum', metric_source.CLUSTER_DIMENSION)
         if not swap.empty:
             memory['swap_max_bytes'] = _safe(float(swap['Value'].max()), 0)
 
-        # WP2: BytesUsedForCache, newly discovered rather than curated.
-        bytes_avg = _dedup_metric_stat(metrics_df, 'BytesUsedForCache', cluster_id, 'Average', 'mean')
+        # BytesUsedForMemoryDB -- the rename of ElastiCache's BytesUsedForCache.
+        bytes_avg = _dedup_metric_stat(metrics_df, metric_source.BYTES_USED, cluster_id, 'Average', 'mean')
         if bytes_avg is not None:
             memory['bytes_used_avg_mb'] = _safe(bytes_avg / (1024 * 1024), 1)
-        bytes_max = _dedup_metric_stat(metrics_df, 'BytesUsedForCache', cluster_id, 'Maximum', 'max')
+        bytes_max = _dedup_metric_stat(metrics_df, metric_source.BYTES_USED, cluster_id, 'Maximum', 'max')
         if bytes_max is not None:
             memory['bytes_used_max_mb'] = _safe(bytes_max / (1024 * 1024), 1)
 
@@ -355,33 +354,32 @@ def build_summary(metrics_df, memtier_minute_df, memtier_totals_df, ecs_df, extr
     # ------------------------------------------------------------------ #
     #  latency_server_us (command-level, server-side)                     #
     # ------------------------------------------------------------------ #
+    # MemoryDB publishes none of GetTypeCmdsLatency, SetTypeCmdsLatency or
+    # StringBasedCmdsLatency, so this block is always empty here. The key
+    # stays because results JSON must remain a strict superset of schema v4,
+    # and it keeps its v4 meaning (per-command-type latency) rather than
+    # being redefined. MemoryDB's server-side latency is reported under
+    # server_request_latency_us below.
     latency_server_us = {}
-    if not metrics_df.empty:
-        for key, mname in [
-            ('get_avg', 'GetTypeCmdsLatency'),
-            ('set_avg', 'SetTypeCmdsLatency'),
-            ('string_avg', 'StringBasedCmdsLatency'),
-        ]:
-            agg = _metric_agg(metrics_df, mname, 'Average', 'CacheClusterId')
-            if agg:
-                latency_server_us[key] = agg['avg']
-        if latency_server_us:
-            # D5: values are already a correct mean of the per-minute
-            # CloudWatch Average; this just states the basis explicitly.
-            latency_server_us['percentile_basis'] = 'minute_average'
 
     # ------------------------------------------------------------------ #
-    #  server_request_latency_us (WP2 -- SuccessfulRead/WriteRequestLatency,   #
-    #  newly discovered; distinct from latency_server_us above, which is       #
-    #  per-command-type minute-average latency, not a percentile)              #
+    #  server_request_latency_us (SuccessfulRead/WriteRequestLatency)     #
     # ------------------------------------------------------------------ #
+    # MemoryDB's only server-side latency: true percentiles in
+    # microseconds, Valkey 7.2+ only, deduplicated across the cluster/node
+    # dimension axis like every other summed or averaged metric here.
+    #
+    # Read and write stay separate keys and are never averaged together.
+    # MemoryDB commits every write to a multi-AZ transaction log, so writes
+    # run roughly an order of magnitude slower than reads by design; a
+    # single blended "server latency" number would describe neither.
     server_request_latency_us = {}
     if not metrics_df.empty:
         for key, mname, stat, agg in (
-            ('read_avg', 'SuccessfulReadRequestLatency', 'Average', 'mean'),
-            ('read_p99', 'SuccessfulReadRequestLatency', 'p99', 'mean'),
-            ('write_avg', 'SuccessfulWriteRequestLatency', 'Average', 'mean'),
-            ('write_p99', 'SuccessfulWriteRequestLatency', 'p99', 'mean'),
+            ('read_avg', metric_source.READ_LATENCY, 'Average', 'mean'),
+            ('read_p99', metric_source.READ_LATENCY, 'p99', 'mean'),
+            ('write_avg', metric_source.WRITE_LATENCY, 'Average', 'mean'),
+            ('write_p99', metric_source.WRITE_LATENCY, 'p99', 'mean'),
         ):
             value = _dedup_metric_stat(metrics_df, mname, cluster_id, stat, agg)
             if value is not None:
@@ -426,8 +424,8 @@ def build_summary(metrics_df, memtier_minute_df, memtier_totals_df, ecs_df, extr
     # One aggregation (median/max across tasks) of the already-final per-task
     # memtier Totals, instead of two (mean-of-minutes then mean/max-across-
     # tasks). Still not a true run-wide percentile -- memtier reports no such
-    # thing without an HDR histogram merge (out of scope, see PLAN_2.md
-    # "Извън обхвата") -- hence "task_median", not "run_p*".
+    # thing without an HDR histogram merge, which is out of scope -- hence
+    # "task_median", not "run_p*".
     if memtier_totals_df is not None and not memtier_totals_df.empty:
         for new_key, column, agg in (
             ('task_median_p50_ms', 'p50_latency_ms', 'median'),
@@ -451,7 +449,7 @@ def build_summary(metrics_df, memtier_minute_df, memtier_totals_df, ecs_df, extr
     # ------------------------------------------------------------------ #
     connections = {}
     if not metrics_df.empty:
-        conn_df = metric_filter(metrics_df, 'CurrConnections', 'Average', 'CacheClusterId')
+        conn_df = metric_filter(metrics_df, 'CurrConnections', 'Average', metric_source.CLUSTER_DIMENSION)
         if not conn_df.empty:
             agg = conn_df.groupby('Timestamp')['Value'].mean()
             connections['avg'] = _safe(float(agg.mean()), 1)
@@ -479,15 +477,23 @@ def build_summary(metrics_df, memtier_minute_df, memtier_totals_df, ecs_df, extr
         extra_stats.get('container_insights_service_df'),
         first_message_ts,
         last_message_ts,
-        measured_elasticache_az=config.get('elasticache_availability_zone'),
+        measured_memorydb_az=config.get('elasticache_availability_zone'),
         memtier_totals_df=memtier_totals_df,
         requested_task_count=config.get('task_count'),
     ) if first_message_ts is not None and last_message_ts is not None else {}
     if loadgen.get('expected_task_count') is not None:
         ecs['task_count'] = loadgen['expected_task_count']
 
+    # MemoryDB-only topology gets its own top-level key, so nothing here
+    # redefines or displaces a schema-v4 key.
+    memorydb_section = {
+        'num_shards':             config.get('num_shards', ''),
+        'num_replicas_per_shard': config.get('num_replicas_per_shard', ''),
+    }
+
     return {
         'meta':               meta,
+        'memorydb':           memorydb_section,
         'benchmark':          benchmark,
         'cache_efficiency':   cache_efficiency,
         'oom':                oom,

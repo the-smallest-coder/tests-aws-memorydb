@@ -4,7 +4,7 @@
 # this `terraform apply` ran from, and whether the working tree was dirty.
 #
 # Invoked by Terraform's `data "external" "git_sha"` block (main.tf). Same
-# external-program protocol as fetch_elasticache_price.sh: print exactly one
+# external-program protocol as fetch_memorydb_price.sh: print exactly one
 # flat JSON object of string->string to stdout, and ALWAYS exit 0 -- a
 # non-zero exit fails the entire `terraform apply`/`terraform destroy`, which
 # provenance metadata must never do. On any failure (git missing, this

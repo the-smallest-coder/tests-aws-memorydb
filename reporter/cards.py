@@ -4,6 +4,8 @@ from html import escape
 
 from formatting import format_gib as _format_gib, format_usd_hour as _format_usd_hour
 
+import metric_source
+
 
 def _html(value):
     return escape(str(value), quote=True)
@@ -12,8 +14,13 @@ def _html(value):
 def header_pills(config):
     """Return the header pills HTML for the config badge row."""
     config = config or {}
-    cluster_mode = str(config.get('cluster_mode', 'false')).lower() == 'true'
-    mode_label = 'Cluster Mode' if cluster_mode else 'Non-Cluster'
+    # MemoryDB is always sharded, so the pill states the shape rather than a
+    # mode that cannot vary. Replicas are called out because they are what
+    # multiplies the bill: nodes = shards x (replicas + 1).
+    shards = config.get('num_shards') or 1
+    replicas = config.get('num_replicas_per_shard')
+    replicas = 0 if replicas in (None, '') else replicas
+    mode_label = f'{shards} shard{"s" if str(shards) != "1" else ""} x {replicas} replica{"s" if str(replicas) != "1" else ""}'
     node_memory = _format_gib(config.get('node_memory_bytes'))
     node_hourly = _format_usd_hour(config.get('node_hourly_usd'))
     engine_type = config.get('engine_type')
@@ -21,7 +28,7 @@ def header_pills(config):
 
     # A missing price should say why, not just silently vanish from the
     # badge row. source/reason come from the live AWS Price List lookup
-    # (see ecs.tf / scripts/fetch_elasticache_price.sh); source is only
+    # (see ecs.tf / scripts/fetch_memorydb_price.sh); source is only
     # populated once a lookup was actually attempted (or explicitly
     # disabled), so its absence here means "legacy run, never had one" --
     # nothing useful to say, so no pill at all, same as before.
@@ -70,7 +77,7 @@ def stat_cards_html(
     """Build the stat-cards grid HTML from all data sources."""
     from helpers import (
         metric_filter,
-        cache_hit_rate_df,
+        keyspace_hit_rate_df,
         select_mem_dims,
         cloudwatch_eviction_series,
         first_positive_timestamp,
@@ -83,7 +90,7 @@ def stat_cards_html(
     node_memory = _format_gib(config.get('node_memory_bytes'))
     if node_memory:
         cards.append(('Node Memory', node_memory, 'GiB', '#546e7a',
-                      'Configured ElastiCache node memory used to compute memtier keyspace.'))
+                      'Configured MemoryDB node memory used to compute memtier keyspace.'))
 
     node_hourly = _format_usd_hour(config.get('node_hourly_usd'))
     if node_hourly:
@@ -159,10 +166,16 @@ def stat_cards_html(
             cards.append(('ECS Tasks', f"{int(task_df['Value'].max())}", '', '#5c6bc0',
                           'Peak number of concurrent ECS tasks during the test.'))
 
-    # ---- ElastiCache Memory ----
+    # ---- MemoryDB Memory ----
     if not metrics_df.empty:
-        for metric in ('DatabaseMemoryUsageCountedForEvictPercentage',
-                       'DatabaseCapacityUsageCountedForEvictPercentage'):
+        # MemoryDB publishes DatabaseMemoryUsagePercentage and
+        # DatabaseCapacityUsagePercentage, but not the *CountedForEvict
+        # variants the ElastiCache project preferred. Those two were the
+        # eviction-aware figures; without them this is plain memory usage, so
+        # the "headroom" it yields is against total memory, not against the
+        # eviction threshold.
+        for metric in ('DatabaseMemoryUsagePercentage',
+                       'DatabaseCapacityUsagePercentage'):
             mem_df = metric_filter(metrics_df, metric, 'Average')
             if not mem_df.empty:
                 keep_dims = select_mem_dims(mem_df['Dimensions'], config.get('node_count', 1))
@@ -173,24 +186,26 @@ def stat_cards_html(
                 cards.append(('Avg Memory', f"{mem_df['Value'].mean():.2f}", '%', '#a142f4', ''))
                 cards.append(('Max Memory', f"{max_mem:.2f}", '%', '#a142f4', ''))
                 cards.append(('Mem Headroom', f"{headroom:+.1f}", '%', headroom_color,
-                              '100 − peak memory usage. Negative means eviction territory.'))
+                              '100 − peak memory usage.'))
                 break
 
-    # ---- Redis Engine CPU ----
+    # ---- Engine CPU ----
     if not metrics_df.empty:
-        eng_cpu_df = metric_filter(metrics_df, 'EngineCPUUtilization', 'Average', 'CacheClusterId')
+        eng_cpu_df = metric_filter(metrics_df, 'EngineCPUUtilization', 'Average', metric_source.CLUSTER_DIMENSION)
         if not eng_cpu_df.empty:
             cards.append(('Engine CPU Peak', f"{eng_cpu_df['Value'].max():.1f}", '%', '#e65100',
-                          'Peak Redis engine thread CPU utilization. More precise than host CPU for burstable T-type instances.'))
+                          'Peak engine thread CPU utilization. More precise than host CPU for burstable T-type instances.'))
 
-    # ---- Cache Hit Rate (report window) ----
+    # ---- Keyspace Hit Rate (report window) ----
     if not metrics_df.empty:
-        hr_df = cache_hit_rate_df(metrics_df)
+        hr_df = keyspace_hit_rate_df(metrics_df)
         if not hr_df.empty:
             avg_hr = hr_df['Value'].mean()
             hr_color = '#188038' if avg_hr >= 90 else ('#e8710a' if avg_hr >= 70 else '#d93025')
-            cards.append(('Cache Hit Rate', f"{avg_hr:.1f}", '%', hr_color,
-                          'Avg Redis CacheHitRate in the report window. <70% = significant misses/evictions.'))
+            cards.append(('Keyspace Hit Rate', f"{avg_hr:.1f}", '%', hr_color,
+                          'Derived from KeyspaceHits/KeyspaceMisses over the report window. '
+                          'MemoryDB publishes no hit-rate metric directly. '
+                          '<70% = significant misses/evictions.'))
 
     # ---- Total Evictions (CloudWatch) ----
     if not metrics_df.empty:
@@ -203,7 +218,7 @@ def stat_cards_html(
 
     # ---- FreeableMemory minimum ----
     if not metrics_df.empty:
-        free_df = metric_filter(metrics_df, 'FreeableMemory', 'Minimum', 'CacheClusterId')
+        free_df = metric_filter(metrics_df, 'FreeableMemory', 'Minimum', metric_source.CLUSTER_DIMENSION)
         if not free_df.empty:
             min_free_mb = free_df['Value'].min() / (1024 * 1024)
             free_color = '#188038' if min_free_mb > 50 else ('#e8710a' if min_free_mb > 10 else '#d93025')
@@ -212,7 +227,7 @@ def stat_cards_html(
 
     # ---- Peak key count ----
     if not metrics_df.empty:
-        items_df = metric_filter(metrics_df, 'CurrItems', 'Maximum', 'CacheClusterId')
+        items_df = metric_filter(metrics_df, 'CurrItems', 'Maximum', metric_source.CLUSTER_DIMENSION)
         if not items_df.empty:
             cards.append(('Peak Key Count', f"{int(items_df['Value'].max()):,}", '', '#546e7a',
                           'Peak number of keys in cache. Drops below expected if eviction removed keys.'))
@@ -300,18 +315,18 @@ def loadgen_quality_html(loadgen):
             f"<td>{_html(throughput_text)}</td></tr>"
         )
 
-    elasticache_az = loadgen.get('elasticache_availability_zone')
-    elasticache_az_source = loadgen.get('elasticache_availability_zone_source')
+    memorydb_az = loadgen.get('elasticache_availability_zone')
+    memorydb_az_source = loadgen.get('elasticache_availability_zone_source')
     az_rows = []
     for row in loadgen.get('throughput_by_az', []):
         ratio = row.get('p90_to_p10')
         ratio_text = f"{float(ratio):.2f}" if ratio is not None else 'n/a'
         az = row.get('availability_zone', 'unknown')
-        if az == elasticache_az:
-            if elasticache_az_source == 'inferred_from_memtier_task_p50_latency':
-                az = f"{az} — ElastiCache AZ (inferred from memtier task latency)"
+        if az == memorydb_az:
+            if memorydb_az_source == 'inferred_from_memtier_task_p50_latency':
+                az = f"{az} — MemoryDB AZ (inferred from memtier task latency)"
             else:
-                az = f"{az} — ElastiCache AZ"
+                az = f"{az} — MemoryDB AZ"
         az_rows.append(
             f"<tr><td>{_html(az)}</td>"
             f"<td>{_html(row.get('task_count', ''))}</td>"

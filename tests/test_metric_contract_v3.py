@@ -1,6 +1,6 @@
 """WP1 -- dedup helper, network/latency fixes, schema v3.
 
-See PLAN_2.md WP1. The D1 double-write/freeze scaffolding these tests
+The double-write/freeze scaffolding these tests
 originally also covered (DEPRECATED_FIELDS, legacy_path fallback rendering,
 the D1a sunset test) was removed once the schema-v4 cleanup retired it; see
 that commit for why. What's left here is the dedup helper and the
@@ -24,10 +24,18 @@ def _skip_if_no_pandas(test_case, exc):
     raise exc
 
 
+# MemoryDB dimension strings as the exporter writes them: the cluster-level
+# aggregate carries ClusterName alone, a node row carries ClusterName and
+# NodeName together (see reporter/metric_source.py).
+AGGREGATE = "ClusterName=cluster-a"
+NODE_1 = "ClusterName=cluster-a;NodeName=cluster-a-0001-001"
+NODE_2 = "ClusterName=cluster-a;NodeName=cluster-a-0001-002"
+
+
 def _metric_row(timestamp, value, dimensions, metric_name="GetTypeCmds", stat="Sum"):
     return {
         "Timestamp": timestamp,
-        "Namespace": "AWS/ElastiCache",
+        "Namespace": "AWS/MemoryDB",
         "MetricName": metric_name,
         "Stat": stat,
         "Value": value,
@@ -51,8 +59,8 @@ class SelectNodeDimensionRowsTests(unittest.TestCase):
         pd, select_node_dimension_rows = self._load()
 
         df = pd.DataFrame([
-            {"Dimensions": "CacheClusterId=cluster-a", "Value": 168860450},
-            {"Dimensions": "CacheClusterId=cluster-a;CacheNodeId=0001", "Value": 168860450},
+            {"Dimensions": AGGREGATE, "Value": 168860450},
+            {"Dimensions": NODE_1, "Value": 168860450},
         ])
 
         selected = select_node_dimension_rows(df, "cluster-a")
@@ -63,41 +71,45 @@ class SelectNodeDimensionRowsTests(unittest.TestCase):
         pd, select_node_dimension_rows = self._load()
 
         df = pd.DataFrame([
-            {"Dimensions": "CacheClusterId=cluster-a;CacheNodeId=0001", "Value": 100},
-            {"Dimensions": "CacheClusterId=cluster-a;CacheNodeId=0002", "Value": 50},
+            {"Dimensions": NODE_1, "Value": 100},
+            {"Dimensions": NODE_2, "Value": 50},
         ])
 
         selected = select_node_dimension_rows(df, "cluster-a")
 
         self.assertEqual(float(selected["Value"].sum()), 150)
 
-    def test_multi_node_bare_ids_fall_back_to_summing_all_node_rows(self):
+    def test_nodes_across_shards_are_summed_when_aggregate_is_absent(self):
+        """Replaces the ElastiCache "bare node-scoped CacheClusterId" case,
+        which has no MemoryDB counterpart: here shard identity lives in the
+        node name, not in a separate cluster-id per node."""
         pd, select_node_dimension_rows = self._load()
 
         df = pd.DataFrame([
-            {"Dimensions": "CacheClusterId=cluster-a-001", "Value": 999},  # bare aggregate-looking, but 2 distinct IDs
-            {"Dimensions": "CacheClusterId=cluster-a-002", "Value": 999},
-            {"Dimensions": "CacheClusterId=cluster-a-001;CacheNodeId=0001", "Value": 10},
-            {"Dimensions": "CacheClusterId=cluster-a-002;CacheNodeId=0001", "Value": 20},
+            {"Dimensions": "ClusterName=cluster-a;NodeName=cluster-a-0001-001", "Value": 10},
+            {"Dimensions": "ClusterName=cluster-a;NodeName=cluster-a-0002-001", "Value": 20},
         ])
 
         selected = select_node_dimension_rows(df, "cluster-a")
 
-        # Two distinct bare IDs -> no single aggregate; falls back to node rows.
         self.assertEqual(float(selected["Value"].sum()), 30)
 
-    def test_suffixed_replication_group_id_selects_bare_row(self):
+    def test_cluster_whose_name_extends_this_one_is_not_selected(self):
+        """The ElastiCache helper deliberately matched "<id>-..." prefixes,
+        because non-cluster-mode node IDs were "<replication-group>-001". On
+        MemoryDB the same prefix match would pick up a different cluster
+        ("cluster-a-2") in a shared account, so selection is exact."""
         pd, select_node_dimension_rows = self._load()
 
         df = pd.DataFrame([
-            {"Dimensions": "CacheClusterId=cluster-a-001", "Value": 42},
+            {"Dimensions": NODE_1, "Value": 10},
+            {"Dimensions": "ClusterName=cluster-a-2", "Value": 999},
+            {"Dimensions": "ClusterName=cluster-a-2;NodeName=cluster-a-2-0001-001", "Value": 999},
         ])
 
-        # This is the real production path: meta.cluster_id is the bare
-        # replication group id, the dimension carries a "-001" node suffix.
         selected = select_node_dimension_rows(df, "cluster-a")
 
-        self.assertEqual(float(selected["Value"].sum()), 42)
+        self.assertEqual(float(selected["Value"].sum()), 10)
 
 
 class NetworkFixTests(unittest.TestCase):
@@ -130,8 +142,8 @@ class NetworkFixTests(unittest.TestCase):
     def test_out_kib_per_sec_is_not_double_counted_from_aggregate_and_node_rows(self):
         try:
             summary = self._build_summary([
-                _metric_row("2026-08-10T00:00:00Z", 3600 * 1024, "CacheClusterId=cluster-a", "NetworkBytesOut"),
-                _metric_row("2026-08-10T00:00:00Z", 3600 * 1024, "CacheClusterId=cluster-a;CacheNodeId=0001", "NetworkBytesOut"),
+                _metric_row("2026-08-10T00:00:00Z", 3600 * 1024, AGGREGATE, "NetworkBytesOut"),
+                _metric_row("2026-08-10T00:00:00Z", 3600 * 1024, NODE_1, "NetworkBytesOut"),
             ])
         except ModuleNotFoundError as exc:
             _skip_if_no_pandas(self, exc)
@@ -144,7 +156,7 @@ class NetworkFixTests(unittest.TestCase):
     def test_known_byte_sum_converts_exactly_via_division_by_60(self):
         try:
             summary = self._build_summary([
-                _metric_row("2026-08-10T00:00:00Z", 60 * 1024, "CacheClusterId=cluster-a", "NetworkBytesOut"),
+                _metric_row("2026-08-10T00:00:00Z", 60 * 1024, AGGREGATE, "NetworkBytesOut"),
             ])
         except ModuleNotFoundError as exc:
             _skip_if_no_pandas(self, exc)
@@ -156,16 +168,16 @@ class NetworkFixTests(unittest.TestCase):
     def test_bw_out_exceeded_count_is_deduplicated_not_double_counted(self):
         try:
             summary = self._build_summary([
-                _metric_row("2026-08-10T00:00:00Z", 9, "CacheClusterId=cluster-a", "NetworkBandwidthOutAllowanceExceeded"),
-                _metric_row("2026-08-10T00:00:00Z", 9, "CacheClusterId=cluster-a;CacheNodeId=0001", "NetworkBandwidthOutAllowanceExceeded"),
+                _metric_row("2026-08-10T00:00:00Z", 9, AGGREGATE, "NetworkBandwidthOutAllowanceExceeded"),
+                _metric_row("2026-08-10T00:00:00Z", 9, NODE_1, "NetworkBandwidthOutAllowanceExceeded"),
             ])
         except ModuleNotFoundError as exc:
             _skip_if_no_pandas(self, exc)
             return
 
         # Same duplicate-dimension input the 120x network bug came from
-        # (D6): aggregate and CacheNodeId rows carry the same value, only
-        # one should be counted.
+        # (D6): aggregate and node rows carry the same value, only one
+        # should be counted.
         self.assertEqual(summary["network"]["throttling"]["bw_out_exceeded_count"], 9)
 
 
@@ -188,7 +200,7 @@ class ClientLatencyTaskMedianTests(unittest.TestCase):
         ecs_rows = [
             {
                 "Timestamp": "2026-08-10T00:00:00Z",
-                "Namespace": "ElastiCache/LoadGenerator",
+                "Namespace": "MemoryDB/LoadGenerator",
                 "MetricName": "ClientLatency",
                 "Stat": stat,
                 "Value": 99.0,
@@ -205,6 +217,10 @@ class ClientLatencyTaskMedianTests(unittest.TestCase):
             extra_stats={}, config={}, cluster_id="cluster-a", time_range="",
         )
 
+        # The conflicting EMF series must actually be live -- if its namespace
+        # stops matching the loadgen namespace, the rows are filtered out and
+        # the assertions below pass for the wrong reason.
+        self.assertEqual(summary["client_latency"]["p99_ms"], 99.0)
         self.assertEqual(summary["client_latency"]["task_median_p99_ms"], 5.0)
         self.assertNotEqual(summary["client_latency"]["task_median_p99_ms"], 99.0)
 

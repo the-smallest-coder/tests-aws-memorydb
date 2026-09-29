@@ -17,10 +17,30 @@ class LoadgenQualityTests(unittest.TestCase):
             self.skipTest(f"{exc.name} is not installed in this environment")
 
         config = _config_from_cluster_details({
-            "elasticache": {"availability_zone": "us-east-1f"},
+            "memorydb": {"engine": "valkey"},
+            "placement": {"availability_zones": ["us-east-1f"]},
         })
 
         self.assertEqual(config["elasticache_availability_zone"], "us-east-1f")
+
+    def test_multi_az_placement_is_not_reported_as_a_measured_az(self):
+        """A primary in us-east-1b with its replica in us-east-1a records
+        availability_zones = ["us-east-1a", "us-east-1b"]. Taking [0] would
+        label the replica's AZ as the measured cluster AZ; nothing recorded
+        says which node is the primary, so the value must stay unset and the
+        latency inference decide.
+        """
+        try:
+            from report_generator import _config_from_cluster_details
+        except ModuleNotFoundError as exc:
+            self.skipTest(f"{exc.name} is not installed in this environment")
+
+        config = _config_from_cluster_details({
+            "memorydb": {"engine": "valkey"},
+            "placement": {"availability_zones": ["us-east-1a", "us-east-1b"]},
+        })
+
+        self.assertEqual(config["elasticache_availability_zone"], "")
 
     def test_visible_ecs_metrics_are_neutral(self):
         try:
@@ -372,7 +392,7 @@ class LoadgenQualityTests(unittest.TestCase):
             },
         )
 
-    def test_elasticache_az_tasks_receive_first_indexes(self):
+    def test_memorydb_az_tasks_receive_first_indexes(self):
         try:
             from helpers import ecs_task_index_map
         except ModuleNotFoundError as exc:
@@ -392,12 +412,12 @@ class LoadgenQualityTests(unittest.TestCase):
         self.assertEqual([indexes["task-b"], indexes["task-d"]], [1, 2])
         self.assertEqual([indexes["task-a"], indexes["task-c"]], [3, 4])
 
-    def test_missing_elasticache_az_is_inferred_from_task_latency_and_marked(self):
+    def test_missing_memorydb_az_is_inferred_from_task_latency_and_marked(self):
         try:
             import pandas as pd
 
             from cards import loadgen_quality_html
-            from helpers import elasticache_availability_zone
+            from helpers import memorydb_availability_zone
             from loadgen_analysis import build_loadgen_summary
         except ModuleNotFoundError as exc:
             if exc.name == "pandas":
@@ -413,7 +433,7 @@ class LoadgenQualityTests(unittest.TestCase):
         # A prior version of this fallback joined on the ECS ClientLatency
         # EMF metric instead, whose TaskId dimension is a self-generated
         # UUID in a completely different namespace (also captured from the
-        # same run, see test_elasticache_az_inference_ignores_disjoint_ids
+        # same run, see test_memorydb_az_inference_ignores_disjoint_ids
         # below) - that join always failed silently on real data.
         task_az = {
             "2e5ee144bb604580a48b378e5300d81c": "us-east-1f",
@@ -432,7 +452,7 @@ class LoadgenQualityTests(unittest.TestCase):
             "d137d22478864d45a79f314f4a5667a3": 0.599,
         }
 
-        inferred = elasticache_availability_zone(
+        inferred = memorydb_availability_zone(
             task_latency_map=task_p50,
             task_az_map=task_az,
         )
@@ -496,7 +516,7 @@ class LoadgenQualityTests(unittest.TestCase):
             result["elasticache_availability_zone_source"],
             "inferred_from_memtier_task_p50_latency",
         )
-        # us-east-1f (the inferred ElastiCache AZ) must rank first.
+        # us-east-1f (the inferred MemoryDB AZ) must rank first.
         self.assertEqual(
             [row["task_id"] for row in result["throughput_median_by_task"]],
             [
@@ -515,7 +535,7 @@ class LoadgenQualityTests(unittest.TestCase):
 
         html = loadgen_quality_html(result)
         self.assertIn(
-            "us-east-1f — ElastiCache AZ (inferred from memtier task latency)",
+            "us-east-1f — MemoryDB AZ (inferred from memtier task latency)",
             html,
         )
 
@@ -553,7 +573,7 @@ class LoadgenQualityTests(unittest.TestCase):
             },
         )
 
-    def test_elasticache_az_inference_ignores_disjoint_client_latency_uuids(self):
+    def test_memorydb_az_inference_ignores_disjoint_client_latency_uuids(self):
         """Regression: the legacy ECS-ClientLatency-based fallback joined on
         the wrong ID namespace and always failed closed on real data. A
         latency map keyed by those same (real, captured) ClientLatency
@@ -562,7 +582,7 @@ class LoadgenQualityTests(unittest.TestCase):
         than silently misattributing the AZ.
         """
         try:
-            from helpers import elasticache_availability_zone
+            from helpers import memorydb_availability_zone
         except ModuleNotFoundError as exc:
             self.skipTest(f"{exc.name} is not installed in this environment")
 
@@ -586,7 +606,7 @@ class LoadgenQualityTests(unittest.TestCase):
             "949de4b1-fdae-4ccb-aa05-78f6221f7817",
         ]
 
-        result = elasticache_availability_zone(
+        result = memorydb_availability_zone(
             task_latency_map=dict.fromkeys(client_latency_uuids, 0.2),
             task_az_map=task_az,
         )
@@ -594,14 +614,14 @@ class LoadgenQualityTests(unittest.TestCase):
         self.assertIsNone(result["availability_zone"])
         self.assertEqual(result["source"], "unavailable")
 
-    def test_elasticache_az_inference_is_ambiguous_when_azs_are_close(self):
+    def test_memorydb_az_inference_is_ambiguous_when_azs_are_close(self):
         """Two AZs within noise of each other (here ~1.05x apart) must not
         produce a confident winner - that would be exactly as overconfident
         as the alphabetical-fallback bug this whole fix replaced, just
         dressed up with real-looking numbers.
         """
         try:
-            from helpers import elasticache_availability_zone
+            from helpers import memorydb_availability_zone
         except ModuleNotFoundError as exc:
             self.skipTest(f"{exc.name} is not installed in this environment")
 
@@ -613,7 +633,7 @@ class LoadgenQualityTests(unittest.TestCase):
         }
         task_p50 = {"task-a": 0.20, "task-b": 0.20, "task-c": 0.21, "task-d": 0.21}
 
-        result = elasticache_availability_zone(
+        result = memorydb_availability_zone(
             task_latency_map=task_p50,
             task_az_map=task_az,
         )
@@ -621,18 +641,18 @@ class LoadgenQualityTests(unittest.TestCase):
         self.assertIsNone(result["availability_zone"])
         self.assertEqual(result["source"], "ambiguous")
 
-    def test_elasticache_az_inference_resolves_at_the_separation_threshold(self):
+    def test_memorydb_az_inference_resolves_at_the_separation_threshold(self):
         """The runner-up clears AZ_INFERENCE_MIN_SEPARATION_RATIO (1.5x) -
         at/above that separation counts as resolvable, not ambiguous.
         (0.32 rather than an exact 0.30 to avoid float-precision noise
         right at the 1.5x boundary itself.)
         """
         try:
-            from helpers import elasticache_availability_zone
+            from helpers import memorydb_availability_zone
         except ModuleNotFoundError as exc:
             self.skipTest(f"{exc.name} is not installed in this environment")
 
-        result = elasticache_availability_zone(
+        result = memorydb_availability_zone(
             task_latency_map={"task-a": 0.20, "task-b": 0.32},
             task_az_map={"task-a": "us-east-1e", "task-b": "us-east-1f"},
         )
@@ -642,11 +662,11 @@ class LoadgenQualityTests(unittest.TestCase):
 
     def test_zero_latency_does_not_choose_an_alphabetical_az(self):
         try:
-            from helpers import elasticache_availability_zone
+            from helpers import memorydb_availability_zone
         except ModuleNotFoundError as exc:
             self.skipTest(f"{exc.name} is not installed in this environment")
 
-        result = elasticache_availability_zone(
+        result = memorydb_availability_zone(
             task_latency_map={"task-a": 0.0, "task-b": 0.2},
             task_az_map={"task-a": "us-east-1e", "task-b": "us-east-1f"},
         )
@@ -654,7 +674,7 @@ class LoadgenQualityTests(unittest.TestCase):
         self.assertIsNone(result["availability_zone"])
         self.assertEqual(result["source"], "ambiguous")
 
-    def test_ambiguous_elasticache_az_is_reported_in_unknown_reasons(self):
+    def test_ambiguous_memorydb_az_is_reported_in_unknown_reasons(self):
         try:
             import pandas as pd
 

@@ -1,6 +1,3 @@
-# UNPORTED — copied from tests-aws-elasticache-redis @ HEAD.
-# Still uses the elasticache boto3 client. See PLAN.md work package WP4.
-
 import html
 import os
 import re
@@ -8,7 +5,7 @@ import re
 import boto3
 
 ecs = boto3.client("ecs")
-elasticache = boto3.client("elasticache")
+memorydb = boto3.client("memorydb")
 
 
 def _ses_config():
@@ -29,7 +26,7 @@ def _ses_config():
     if "@" in identity:
         source_email = identity
     else:
-        source_email = f"aws-elasticache-lab@{identity}"
+        source_email = f"aws-memorydb-lab@{identity}"
     
     return {
         "client": boto3.client("ses", region_name=ses_region),
@@ -120,7 +117,7 @@ def _build_verify_html(header_title, header_bg, cluster_id, rows, aws_region="")
         <tr>
           <td style="background-color:#f8f9fa;padding:20px 40px;border-top:1px solid #e8eaed;">
             <p style="margin:0;font-size:12px;color:#80868b;text-align:center;">
-              Automated notification from ElastiCache Performance Lab&nbsp;&nbsp;&#8226;&nbsp;&nbsp;{aws_region_html}
+              Automated notification from MemoryDB Performance Lab&nbsp;&nbsp;&#8226;&nbsp;&nbsp;{aws_region_html}
             </p>
           </td>
         </tr>
@@ -147,17 +144,21 @@ def _ecs_running(cluster, service):
         return True, f"describe_failed: {exc}"
 
 
-def _elasticache_running(replication_group_id):
+def _memorydb_running(cluster_name):
     try:
-        resp = elasticache.describe_replication_groups(
-            ReplicationGroupId=replication_group_id
-        )
-        groups = resp.get("ReplicationGroups", [])
-        if not groups:
+        resp = memorydb.describe_clusters(ClusterName=cluster_name)
+        clusters = resp.get("Clusters", [])
+        if not clusters:
             return False, "not_found"
-        status = groups[0].get("Status", "unknown")
+        status = clusters[0].get("Status", "unknown")
+        # "deleting" means the shutdown Lambda's delete_cluster was accepted
+        # and teardown is under way. This probe runs exactly once, so treating
+        # a slow delete as "still running" would skip the exporter launch and
+        # leave the run with no report at all.
+        if status == "deleting":
+            return False, f"status={status}"
         return True, f"status={status}"
-    except elasticache.exceptions.ReplicationGroupNotFoundFault:
+    except memorydb.exceptions.ClusterNotFoundFault:
         return False, "not_found"
     except Exception as exc:
         return True, f"describe_failed: {exc}"
@@ -191,7 +192,7 @@ def _launch_exporter_task(cluster_id, ecs_cluster, ecs_service):
 
     env_names = [
         "CLUSTER_ID",
-        "ELASTICACHE_ID",
+        "MEMORYDB_CLUSTER_NAME",
         "ECS_CLUSTER",
         "ECS_SERVICE",
         "S3_BUCKET",
@@ -201,13 +202,11 @@ def _launch_exporter_task(cluster_id, ecs_cluster, ecs_service):
         "LOG_GROUP",
         "LOADGEN_LOG_GROUP",
         "CONTAINER_INSIGHTS_LOG_GROUP",
-        "ELASTICACHE_LOG_GROUP",
         "LAMBDA_SCHEDULER_LOG_GROUP",
         "TEST_DURATION_MINUTES",
-        "CLUSTER_MODE",
-        "NUM_CACHE_NODES",
-        "NUM_NODE_GROUPS",
-        "REPLICAS_PER_NODE_GROUP",
+        "NUM_NODES",
+        "NUM_SHARDS",
+        "NUM_REPLICAS_PER_SHARD",
         "ENGINE_TYPE",
         "ENGINE_VERSION",
         "NODE_TYPE",
@@ -268,14 +267,14 @@ def handler(event, context):
     cluster_id = os.environ.get("CLUSTER_ID", "")
     ecs_cluster = os.environ["ECS_CLUSTER"]
     ecs_service = os.environ["ECS_SERVICE"]
-    elasticache_id = os.environ["ELASTICACHE_ID"]
+    memorydb_cluster_name = os.environ["MEMORYDB_CLUSTER_NAME"]
     aws_region = os.environ.get("AWS_REGION_NAME", os.environ.get("AWS_DEFAULT_REGION", ""))
 
     ecs_is_running, ecs_detail = _ecs_running(ecs_cluster, ecs_service)
-    elasticache_is_running, elasticache_detail = _elasticache_running(elasticache_id)
+    memorydb_is_running, memorydb_detail = _memorydb_running(memorydb_cluster_name)
 
     if ecs_is_running:
-        subject = f"[ElastiCache Test Warning] ECS tasks still running ({cluster_id})"
+        subject = f"[MemoryDB Test Warning] ECS tasks still running ({cluster_id})"
         body_text = (
             f"ECS tasks are still running.\n\n"
             f"Cluster: {cluster_id}\n"
@@ -291,30 +290,30 @@ def handler(event, context):
         )
         _send_email(subject, body_text, body_html)
 
-    if elasticache_is_running:
-        subject = f"[ElastiCache Test Warning] ElastiCache still running ({cluster_id})"
+    if memorydb_is_running:
+        subject = f"[MemoryDB Test Warning] MemoryDB still running ({cluster_id})"
         body_text = (
-            f"ElastiCache replication group still exists.\n\n"
+            f"MemoryDB cluster still exists.\n\n"
             f"Cluster: {cluster_id}\n"
-            f"ReplicationGroupId: {elasticache_id}\n"
-            f"Details: {elasticache_detail}\n"
+            f"ClusterName: {memorydb_cluster_name}\n"
+            f"Details: {memorydb_detail}\n"
         )
         body_html = _build_verify_html(
-            "&#9888;&#65039; ElastiCache Still Running",
+            "&#9888;&#65039; MemoryDB Still Running",
             "linear-gradient(135deg,#e37400,#c56200)",
             cluster_id,
-            [(f"ElastiCache ({elasticache_id})", elasticache_detail, False)],
+            [(f"MemoryDB ({memorydb_cluster_name})", memorydb_detail, False)],
             aws_region
         )
         _send_email(subject, body_text, body_html)
 
-    if not ecs_is_running and not elasticache_is_running:
-        subject = f"[ElastiCache Test OK] All resources shut down ({cluster_id})"
+    if not ecs_is_running and not memorydb_is_running:
+        subject = f"[MemoryDB Test OK] All resources shut down ({cluster_id})"
         body_text = (
             f"Shutdown verification completed.\n\n"
             f"Cluster: {cluster_id}\n"
             f"ECS: {ecs_detail}\n"
-            f"ElastiCache: {elasticache_detail}\n"
+            f"MemoryDB: {memorydb_detail}\n"
         )
         body_html = _build_verify_html(
             "&#9989; All Resources Shut Down",
@@ -322,7 +321,7 @@ def handler(event, context):
             cluster_id,
             [
                 ("ECS Service", ecs_detail, True),
-                (f"ElastiCache ({elasticache_id})", elasticache_detail, True),
+                (f"MemoryDB ({memorydb_cluster_name})", memorydb_detail, True),
             ],
             aws_region
         )
@@ -330,7 +329,7 @@ def handler(event, context):
         exporter_result = _launch_exporter_task(cluster_id, ecs_cluster, ecs_service)
         if not exporter_result.get("launched"):
             error = exporter_result.get("error", "unknown error")
-            fail_subject = f"[ElastiCache Test Warning] Report exporter failed to launch ({cluster_id})"
+            fail_subject = f"[MemoryDB Test Warning] Report exporter failed to launch ({cluster_id})"
             fail_body = (
                 f"Shutdown verification passed, but the report exporter ECS task did not launch.\n\n"
                 f"Cluster: {cluster_id}\n"
@@ -342,7 +341,7 @@ def handler(event, context):
                 cluster_id,
                 [
                     ("ECS Service", ecs_detail, True),
-                    (f"ElastiCache ({elasticache_id})", elasticache_detail, True),
+                    (f"MemoryDB ({memorydb_cluster_name})", memorydb_detail, True),
                     ("Report Exporter", error, False),
                 ],
                 aws_region
@@ -354,7 +353,7 @@ def handler(event, context):
     return {
         "ecs_running": ecs_is_running,
         "ecs_detail": ecs_detail,
-        "elasticache_running": elasticache_is_running,
-        "elasticache_detail": elasticache_detail,
+        "memorydb_running": memorydb_is_running,
+        "memorydb_detail": memorydb_detail,
         "exporter_task": exporter_result
     }

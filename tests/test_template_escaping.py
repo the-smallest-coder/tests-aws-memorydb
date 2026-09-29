@@ -189,17 +189,21 @@ class SingleReportEscapingTests(unittest.TestCase):
 
         from cards import stat_cards_html
 
+        # MemoryDB publishes no hit-rate metric; the card derives it from
+        # KeyspaceHits/KeyspaceMisses. 65 / (65 + 35) = 65%, under the 70%
+        # threshold whose "<70%" tooltip text this test checks is escaped.
         metrics_df = pd.DataFrame(
             [
                 {
                     "Timestamp": pd.Timestamp("2026-05-01T00:00:00"),
-                    "Namespace": "AWS/ElastiCache",
-                    "MetricName": "CacheHitRate",
-                    "Stat": "Average",
-                    "Value": 65.0,
-                    "Unit": "Percent",
-                    "Dimensions": "CacheClusterId=cluster-a",
+                    "Namespace": "AWS/MemoryDB",
+                    "MetricName": metric_name,
+                    "Stat": "Sum",
+                    "Value": value,
+                    "Unit": "Count",
+                    "Dimensions": "ClusterName=cluster-a",
                 }
+                for metric_name, value in (("KeyspaceHits", 65.0), ("KeyspaceMisses", 35.0))
             ]
         )
 

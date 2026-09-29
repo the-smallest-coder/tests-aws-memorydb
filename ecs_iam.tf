@@ -1,8 +1,3 @@
-# =============================================================================
-# UNPORTED — copied verbatim from tests-aws-elasticache-redis @ HEAD.
-# This file still targets ElastiCache. See PLAN.md, work package WP4.
-# =============================================================================
-
 # IAM Role for ECS Task Execution (pulling images, pushing logs)
 resource "aws_iam_role" "ecs_task_execution_role" {
   name = "${local.cluster_id}-ecs-execution"
@@ -117,7 +112,7 @@ resource "aws_iam_role_policy" "ecs_task_exporter" {
           "logs:DescribeLogStreams",
           "logs:FilterLogEvents",
           "logs:GetLogEvents",
-          "elasticache:DescribeReplicationGroups"
+          "memorydb:DescribeClusters"
         ]
         Resource = "*"
       },

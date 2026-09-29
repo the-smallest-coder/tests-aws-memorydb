@@ -1,4 +1,4 @@
-"""Comparability contract between two runs (WP4, PLAN_2.md).
+"""Comparability contract between two runs.
 
 Two runs with a different node_type are the point of the experiment,
 not a confound -- but a different memtier pipeline, an unknown loadgen
@@ -11,7 +11,7 @@ is a rendering convenience (the control-variable subset of `reasons`).
 made comparable by any choice of partner. Two runs that each look fine
 individually but differ on more than one intended dimension are not
 "invalid": that is a multi-factor experiment design, a fact about what was
-run, not a data defect (see PLAN_2.md WP4 for the corpus evidence: every
+run, not a data defect (measured against the source project's 81-run corpus: every
 "invalid" case found by naive multi-factor detection turned out to be
 exactly this).
 """
@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from report_common import RunData, get_nested, normalize_cluster_mode
+from report_common import RunData, get_nested
 
 
 INTENDED_DIMENSIONS = ("node_type", "engine", "engine_version")
@@ -31,20 +31,25 @@ CONTROL_VARIABLES: tuple[tuple[str, str], ...] = (
     ("memtier", "key_pattern"), ("memtier", "key_maximum_total"),
     ("memtier", "test_time_seconds"),
     ("ecs", "fargate_cpu"), ("ecs", "fargate_memory"),
-    ("elasticache", "cluster_mode_enabled"), ("elasticache", "num_cache_nodes"),
+    # Topology in MemoryDB's terms. cluster_mode_enabled is gone -- it could
+    # not vary, so it was never a control variable here.
+    ("memorydb", "num_shards"), ("memorydb", "num_replicas_per_shard"),
+    # TLS and data tiering change what is being measured, not just how much:
+    # TLS adds per-connection cost, data tiering moves the working set to SSD.
+    ("memorydb", "tls_enabled"), ("memorydb", "data_tiering"),
 )
 
 # An observed memtier window under this fraction of the *configured*
 # test_time_seconds is a truncated run (crash, early kill, task replaced
 # mid-run) -- not normal jitter. The 81-run corpus's max natural jitter
-# between nominally identical 60-minute runs is 5.3% (PLAN_2.md WP4), an
+# between nominally identical 60-minute runs is 5.3%, an
 # order of magnitude inside this margin. "Run until ECS stops the task"
 # (loadgen_memtier_test_time == 0, ecs.tf's default) has no configured
 # duration to truncate against, so that case must never be flagged -- but
 # test_time_seconds itself can't signal it: memtier's --test-time needs a
 # positive integer, so ecs.tf:194 substitutes 2147483647, not 0, and that
 # is what every artifact this rig produces under the default actually
-# carries. duration_label (node_details.tf:89) is explicit about the same
+# carries. duration_label in node_details.tf is explicit about the same
 # thing instead of relying on a magic number in test_time_seconds.
 TRUNCATED_RUN_WINDOW_RATIO = 0.5
 
@@ -58,7 +63,7 @@ def coerce_control_value(field: str, value: Any) -> Any:
 
     Pre-WP0 (thin) artifacts carry strings ("1", "false"); post-WP0 ones
     carry native JSON types (1, false). Without this, "1" != 1 would report
-    a control_variable_differs that isn't real (PLAN_2.md WP4). Numeric
+    a control_variable_differs that isn't real. Numeric
     values are further collapsed to int when they carry no fraction (1 and
     1.0 must produce the same value): both aggregator.py's fingerprint and
     this module's own control_variable_differs check compare/hash the
@@ -67,8 +72,7 @@ def coerce_control_value(field: str, value: Any) -> Any:
     """
     if value is None:
         return None
-    if field == "cluster_mode_enabled":
-        return normalize_cluster_mode(value)
+
     if isinstance(value, bool):
         return value
     if isinstance(value, (int, float)):

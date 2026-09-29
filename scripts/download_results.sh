@@ -89,7 +89,7 @@ TF_OUTPUT=$(terraform output -json 2>/dev/null) || {
 
 REGION=$(echo "$TF_OUTPUT" | jq -r '.aws_region.value // "us-east-1"' 2>/dev/null || echo "us-east-1")
 S3_LOCATION=$(echo "$TF_OUTPUT" | jq -r '.metrics_export_location.value')
-CLUSTER_ID=$(echo "$TF_OUTPUT" | jq -r '.elasticache_cluster_id.value')
+CLUSTER_ID=$(echo "$TF_OUTPUT" | jq -r '.memorydb_cluster_name.value')
 CLUSTER_NAME=$(echo "$TF_OUTPUT" | jq -r '.loadgen_cluster_name.value')
 SERVICE_NAME=$(echo "$TF_OUTPUT" | jq -r '.loadgen_service_name.value')
 LOG_GROUP=$(echo "$TF_OUTPUT" | jq -r '.loadgen_log_group_name.value')

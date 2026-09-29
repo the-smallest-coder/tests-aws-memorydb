@@ -3,7 +3,7 @@
 node_details.tf uploads a rich artifact at apply time. Before this fix,
 exporter.py's main() clobbered the same S3 key with a thin, env-derived
 subset just before reading it back four lines later in report_generator.py.
-See PLAN_2.md WP0.
+
 """
 
 import importlib.util
@@ -58,7 +58,7 @@ def _as_bytes(value):
 
 
 ENV = {
-    "CLUSTER_ID": "elasticache-perf-test-valkey-20260810-al",
+    "CLUSTER_ID": "memorydb-perf-test-valkey-20260810-al",
     "ECS_CLUSTER": "loadgen-cluster",
     "ECS_SERVICE": "loadgen-service",
     "S3_BUCKET": "test-bucket",
@@ -68,14 +68,15 @@ ENV = {
 CLUSTER_DETAILS_KEY = f"{ENV['S3_PREFIX']}{ENV['REPORT_TIMESTAMP']}/cluster_details.json"
 RICH_ARTIFACT = json.dumps({
     "run": {"cluster_id": ENV["CLUSTER_ID"]},
-    "elasticache": {"availability_zone": "us-east-1f", "engine": "valkey"},
+    "memorydb": {"engine": "valkey"},
+    "placement": {"availability_zones": ["us-east-1f"]},
     "memtier": {"task_count": 6},
 }).encode("utf-8")
 
 
-DEFAULT_ELASTICACHE_MANIFEST = {
+DEFAULT_MEMORYDB_MANIFEST = {
     "uri": "s3://test-bucket/metrics.csv",
-    "discovered": ["CacheHits"],
+    "discovered": ["KeyspaceHits"],
     "exported": 1,
     "zero_datapoints": [],
     "missing_from_discovery": [],
@@ -86,7 +87,7 @@ DEFAULT_ELASTICACHE_MANIFEST = {
 }
 
 
-def _run_main_with_fakes(fake_s3: FakeS3, elasticache_manifest: dict | None = None):
+def _run_main_with_fakes(fake_s3: FakeS3, memorydb_manifest: dict | None = None):
     exporter = _load_exporter()
     exporter.export_loadgen_logs_to_s3 = lambda *a, **k: {
         "complete": True,
@@ -95,8 +96,8 @@ def _run_main_with_fakes(fake_s3: FakeS3, elasticache_manifest: dict | None = No
         "files": [],
     }
     exporter._generate_and_upload_memtier_etl = lambda *a, **k: None
-    exporter.export_elasticache_metrics_to_s3 = lambda *a, **k: (
-        elasticache_manifest if elasticache_manifest is not None else dict(DEFAULT_ELASTICACHE_MANIFEST)
+    exporter.export_memorydb_metrics_to_s3 = lambda *a, **k: (
+        memorydb_manifest if memorydb_manifest is not None else dict(DEFAULT_MEMORYDB_MANIFEST)
     )
     exporter.export_logs_to_s3 = lambda *a, **k: None
     exporter._task_metadata_from_container_insights_object = lambda *a, **k: {}
@@ -139,28 +140,30 @@ class MergeMissingConfigPrecedenceTests(unittest.TestCase):
     def test_rich_artifact_fields_reach_report_config_env_fills_gaps_only(self):
         _config_from_cluster_details, _config_from_env, _merge_missing_config = self._load()
 
+        # node_details.tf records observed placement at the top level, not
+        # inside the "memorydb" block (MemoryDB has no AZ argument to record).
         cluster_details = {
-            "elasticache": {
+            "memorydb": {
                 "engine": "valkey",
-                "node_type": "cache.t4g.micro",
-                "availability_zone": "us-east-1f",
+                "node_type": "db.t4g.small",
             },
+            "placement": {"availability_zones": ["us-east-1f"]},
         }
-        with mock.patch.dict("os.environ", {"ENGINE_TYPE": "valkey", "NODE_TYPE": "cache.t4g.micro"}, clear=True):
+        with mock.patch.dict("os.environ", {"ENGINE_TYPE": "valkey", "NODE_TYPE": "db.t4g.small"}, clear=True):
             report_config = _merge_missing_config(
                 _config_from_cluster_details(cluster_details),
                 _config_from_env(),
             )
 
         self.assertEqual(report_config["engine_type"], "valkey")
-        self.assertEqual(report_config["node_type"], "cache.t4g.micro")
+        self.assertEqual(report_config["node_type"], "db.t4g.small")
         # Only the rich artifact carries this field; env has no equivalent key at all.
         self.assertEqual(report_config["elasticache_availability_zone"], "us-east-1f")
 
     def test_terraform_value_wins_over_a_different_env_value(self):
         _config_from_cluster_details, _config_from_env, _merge_missing_config = self._load()
 
-        cluster_details = {"elasticache": {"node_hourly_usd": "0.226"}}
+        cluster_details = {"memorydb": {"node_hourly_usd": "0.226"}}
         with mock.patch.dict("os.environ", {"NODE_HOURLY_USD": "0.156"}, clear=True):
             report_config = _merge_missing_config(
                 _config_from_cluster_details(cluster_details),
@@ -199,7 +202,7 @@ class MissingClusterDetailsIsAVisibleDefectTests(unittest.TestCase):
             for name in (
                 "read_file_content",
                 "parse_metrics_csv",
-                "_warn_if_cache_hit_rate_missing",
+                "_warn_if_keyspace_hit_rate_underivable",
                 "_read_uploaded_log_contents",
                 "_parse_memtier_log_entries",
                 "_read_uploaded_container_insights_contents",
@@ -211,7 +214,7 @@ class MissingClusterDetailsIsAVisibleDefectTests(unittest.TestCase):
         }
         report_generator.read_file_content = fake_read_file_content
         report_generator.parse_metrics_csv = lambda content: pd.DataFrame()
-        report_generator._warn_if_cache_hit_rate_missing = lambda *a, **k: None
+        report_generator._warn_if_keyspace_hit_rate_underivable = lambda *a, **k: None
         report_generator._read_uploaded_log_contents = lambda prefix: [("s3://bucket/loadgen.log", "log")]
         report_generator._parse_memtier_log_entries = lambda entries: (
             pd.DataFrame(),
@@ -288,7 +291,7 @@ class PresentButEmptyClusterDetailsTests(unittest.TestCase):
             for name in (
                 "read_file_content",
                 "parse_metrics_csv",
-                "_warn_if_cache_hit_rate_missing",
+                "_warn_if_keyspace_hit_rate_underivable",
                 "_read_uploaded_log_contents",
                 "_parse_memtier_log_entries",
                 "_read_uploaded_container_insights_contents",
@@ -300,7 +303,7 @@ class PresentButEmptyClusterDetailsTests(unittest.TestCase):
         }
         report_generator.read_file_content = fake_read_file_content
         report_generator.parse_metrics_csv = lambda content: pd.DataFrame()
-        report_generator._warn_if_cache_hit_rate_missing = lambda *a, **k: None
+        report_generator._warn_if_keyspace_hit_rate_underivable = lambda *a, **k: None
         report_generator._read_uploaded_log_contents = lambda prefix: [("s3://bucket/loadgen.log", "log")]
         report_generator._parse_memtier_log_entries = lambda entries: (
             pd.DataFrame(),
@@ -331,7 +334,7 @@ class PresentButEmptyClusterDetailsTests(unittest.TestCase):
 class MetricsHardAbortGateTests(unittest.TestCase):
     """Regression (code review): the hard RuntimeError abort in main() used
     to be tied to the wide, topology-conditional completeness check
-    (elasticache_manifest["complete"], ~30 names including 4 unconfirmed for
+    (memorydb_manifest["complete"], ~30 names including 4 unconfirmed for
     redis). One optional metric absent for an unrelated reason (ListMetrics
     propagation lag, an engine that doesn't publish it) would abort report
     generation entirely, after the cluster is already torn down. The gate
@@ -340,13 +343,13 @@ class MetricsHardAbortGateTests(unittest.TestCase):
 
     def test_incomplete_wide_contract_with_real_rows_does_not_abort(self):
         fake_s3 = FakeS3(initial={CLUSTER_DETAILS_KEY: RICH_ARTIFACT})
-        manifest = dict(DEFAULT_ELASTICACHE_MANIFEST)
+        manifest = dict(DEFAULT_MEMORYDB_MANIFEST)
         manifest["complete"] = False
         manifest["missing"] = ["CPUCreditBalance", "CPUCreditUsage"]
         manifest["missing_from_discovery"] = ["CPUCreditBalance", "CPUCreditUsage"]
         manifest["rows_written"] = 500
 
-        _run_main_with_fakes(fake_s3, elasticache_manifest=manifest)  # must not raise
+        _run_main_with_fakes(fake_s3, memorydb_manifest=manifest)  # must not raise
 
         status = json.loads(fake_s3.storage[f"{ENV['S3_PREFIX']}{ENV['REPORT_TIMESTAMP']}/report_status.json"])
         self.assertTrue(status["complete"])
@@ -355,12 +358,12 @@ class MetricsHardAbortGateTests(unittest.TestCase):
 
     def test_zero_rows_written_still_aborts(self):
         fake_s3 = FakeS3(initial={CLUSTER_DETAILS_KEY: RICH_ARTIFACT})
-        manifest = dict(DEFAULT_ELASTICACHE_MANIFEST)
+        manifest = dict(DEFAULT_MEMORYDB_MANIFEST)
         manifest["rows_written"] = 0
         manifest["exported"] = 0
 
         with self.assertRaises(RuntimeError):
-            _run_main_with_fakes(fake_s3, elasticache_manifest=manifest)
+            _run_main_with_fakes(fake_s3, memorydb_manifest=manifest)
 
 
 if __name__ == "__main__":

@@ -231,11 +231,11 @@ class EvictionSeriesTests(unittest.TestCase):
             raise
 
         metrics = pd.DataFrame([
-            self._metric("2026-05-01T00:00:00Z", 0, "CacheClusterId=cluster-a"),
-            self._metric("2026-05-01T00:01:00Z", 3, "CacheClusterId=cluster-a"),
-            self._metric("2026-05-01T00:00:00Z", 0, "CacheClusterId=cluster-a;CacheNodeId=0001"),
-            self._metric("2026-05-01T00:01:00Z", 3, "CacheClusterId=cluster-a;CacheNodeId=0001"),
-            self._metric("2026-05-01T00:01:00Z", 4, "CacheClusterId=cluster-a;CacheNodeId=0002"),
+            self._metric("2026-05-01T00:00:00Z", 0, "ClusterName=cluster-a"),
+            self._metric("2026-05-01T00:01:00Z", 3, "ClusterName=cluster-a"),
+            self._metric("2026-05-01T00:00:00Z", 0, "ClusterName=cluster-a;NodeName=cluster-a-0001-001"),
+            self._metric("2026-05-01T00:01:00Z", 3, "ClusterName=cluster-a;NodeName=cluster-a-0001-001"),
+            self._metric("2026-05-01T00:01:00Z", 4, "ClusterName=cluster-a;NodeName=cluster-a-0001-002"),
         ])
         metrics["Timestamp"] = pd.to_datetime(metrics["Timestamp"], utc=True).dt.tz_localize(None)
 
@@ -254,8 +254,8 @@ class EvictionSeriesTests(unittest.TestCase):
             raise
 
         metrics = pd.DataFrame([
-            self._metric("2026-05-01T00:00:00Z", 1, "CacheClusterId=cluster-a;CacheNodeId=0001"),
-            self._metric("2026-05-01T00:00:00Z", 2, "CacheClusterId=cluster-a;CacheNodeId=0002"),
+            self._metric("2026-05-01T00:00:00Z", 1, "ClusterName=cluster-a;NodeName=cluster-a-0001-001"),
+            self._metric("2026-05-01T00:00:00Z", 2, "ClusterName=cluster-a;NodeName=cluster-a-0001-002"),
         ])
         metrics["Timestamp"] = pd.to_datetime(metrics["Timestamp"], utc=True).dt.tz_localize(None)
 
@@ -263,7 +263,10 @@ class EvictionSeriesTests(unittest.TestCase):
 
         self.assertEqual(selected["Value"].tolist(), [3])
 
-    def test_replication_group_id_selects_suffixed_non_cluster_node_rows(self):
+    def test_evictions_of_a_cluster_whose_name_extends_this_one_are_excluded(self):
+        """Replaces the ElastiCache "<replication-group>-001" suffix case.
+        MemoryDB has no node-suffixed cluster IDs, so a "cluster-a-2" row is
+        a different cluster and must not leak into cluster-a's series."""
         try:
             import pandas as pd
             from helpers import cloudwatch_eviction_series
@@ -273,19 +276,20 @@ class EvictionSeriesTests(unittest.TestCase):
             raise
 
         metrics = pd.DataFrame([
-            self._metric("2026-05-01T00:00:00Z", 7, "CacheClusterId=cluster-a-001;CacheNodeId=0001"),
+            self._metric("2026-05-01T00:00:00Z", 1, "ClusterName=cluster-a;NodeName=cluster-a-0001-001"),
+            self._metric("2026-05-01T00:00:00Z", 7, "ClusterName=cluster-a-2;NodeName=cluster-a-2-0001-001"),
         ])
         metrics["Timestamp"] = pd.to_datetime(metrics["Timestamp"], utc=True).dt.tz_localize(None)
 
         selected = cloudwatch_eviction_series(metrics, "cluster-a")
 
-        self.assertEqual(selected["Value"].tolist(), [7])
+        self.assertEqual(selected["Value"].tolist(), [1])
 
     @staticmethod
     def _metric(timestamp: str, value: int, dimensions: str) -> dict:
         return {
             "Timestamp": timestamp,
-            "Namespace": "AWS/ElastiCache",
+            "Namespace": "AWS/MemoryDB",
             "MetricName": "Evictions",
             "Stat": "Sum",
             "Value": value,
@@ -423,9 +427,9 @@ class CardRenderingTests(unittest.TestCase):
 
         empty = pd.DataFrame()
         metrics = pd.DataFrame([
-            EvictionSeriesTests._metric("2026-05-01T00:00:00Z", 0, "CacheClusterId=cluster-a"),
-            EvictionSeriesTests._metric("2026-05-01T01:02:07Z", 1, "CacheClusterId=cluster-a"),
-            EvictionSeriesTests._metric("2026-05-01T00:15:00Z", 9, "CacheClusterId=cluster-b"),
+            EvictionSeriesTests._metric("2026-05-01T00:00:00Z", 0, "ClusterName=cluster-a"),
+            EvictionSeriesTests._metric("2026-05-01T01:02:07Z", 1, "ClusterName=cluster-a"),
+            EvictionSeriesTests._metric("2026-05-01T00:15:00Z", 9, "ClusterName=cluster-b"),
         ])
         metrics["Timestamp"] = pd.to_datetime(metrics["Timestamp"], utc=True).dt.tz_localize(None)
 

@@ -1,6 +1,6 @@
 """WP4 tests 35-46: comparison_contract.build_comparison_contract.
 
-See PLAN_2.md WP4. `invalid` is reserved for a defect in ONE run's own
+`invalid` is reserved for a defect in ONE run's own
 data; two runs that individually look fine but differ on more than one
 intended dimension are `conditional` (multi-factor design), never `invalid`
 -- the plan's own corpus simulation found that every naive "two variables
@@ -32,7 +32,12 @@ def _control_cluster_details(**overrides):
             "test_time_seconds": 3600,
         },
         "ecs": {"fargate_cpu": 512, "fargate_memory": 1024},
-        "elasticache": {"cluster_mode_enabled": False, "num_cache_nodes": 1},
+        "memorydb": {
+            "num_shards": 1,
+            "num_replicas_per_shard": 1,
+            "tls_enabled": True,
+            "data_tiering": False,
+        },
     }
     for path, value in overrides.items():
         section, field = path.split(".")
@@ -224,10 +229,10 @@ class ComparisonContractTests(unittest.TestCase):
         self.assertEqual(diff["candidate"], 16)
         self.assertIn(diff, contract["control_diffs"])
 
-    def test_num_cache_nodes_string_vs_int_is_not_a_diff(self):
+    def test_num_shards_string_vs_int_is_not_a_diff(self):
         build = self._load()
-        baseline = _run("Baseline", _summary(), _control_cluster_details(**{"elasticache.num_cache_nodes": "1"}))
-        candidate = _run("Candidate", _summary(), _control_cluster_details(**{"elasticache.num_cache_nodes": 1}))
+        baseline = _run("Baseline", _summary(), _control_cluster_details(**{"memorydb.num_shards": "1"}))
+        candidate = _run("Candidate", _summary(), _control_cluster_details(**{"memorydb.num_shards": 1}))
 
         contract = build(baseline, candidate)
 
@@ -352,10 +357,10 @@ class ComparisonContractTests(unittest.TestCase):
         """
         build = self._load()
         baseline = _run(
-            "Baseline", _summary(), _control_cluster_details(**{"elasticache.num_cache_nodes": 1}),
+            "Baseline", _summary(), _control_cluster_details(**{"memorydb.num_shards": 1}),
         )
         candidate = _run(
-            "Candidate", _summary(), _control_cluster_details(**{"elasticache.num_cache_nodes": 1.0}),
+            "Candidate", _summary(), _control_cluster_details(**{"memorydb.num_shards": 1.0}),
         )
 
         contract = build(baseline, candidate)
@@ -368,12 +373,12 @@ class ComparisonContractTests(unittest.TestCase):
         except ModuleNotFoundError as exc:
             self.skipTest(f"{exc.name} is not installed in this environment")
 
-        self.assertEqual(coerce_control_value("num_cache_nodes", 1.0), 1)
-        self.assertEqual(coerce_control_value("num_cache_nodes", 1), 1)
-        self.assertEqual(coerce_control_value("num_cache_nodes", "1"), 1)
+        self.assertEqual(coerce_control_value("num_shards", 1.0), 1)
+        self.assertEqual(coerce_control_value("num_shards", 1), 1)
+        self.assertEqual(coerce_control_value("num_shards", "1"), 1)
         self.assertEqual(
-            repr(coerce_control_value("num_cache_nodes", 1.0)),
-            repr(coerce_control_value("num_cache_nodes", "1")),
+            repr(coerce_control_value("num_shards", 1.0)),
+            repr(coerce_control_value("num_shards", "1")),
         )
 
 

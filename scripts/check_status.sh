@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# check_status.sh — Show current state of the ElastiCache performance test.
+# check_status.sh — Show current state of the MemoryDB performance test.
 #
 # Usage:
 #   ./scripts/check_status.sh            # quick status
@@ -55,7 +55,7 @@ TF_OUTPUT=$(terraform output -json 2>/dev/null) || {
 REGION=$(echo "$TF_OUTPUT" | jq -r '.aws_region.value // "us-east-1"' 2>/dev/null || echo "us-east-1")
 CLUSTER_NAME=$(echo "$TF_OUTPUT" | jq -r '.loadgen_cluster_name.value')
 SERVICE_NAME=$(echo "$TF_OUTPUT" | jq -r '.loadgen_service_name.value')
-CLUSTER_ID=$(echo "$TF_OUTPUT" | jq -r '.elasticache_cluster_id.value')
+CLUSTER_ID=$(echo "$TF_OUTPUT" | jq -r '.memorydb_cluster_name.value')
 LOG_GROUP=$(echo "$TF_OUTPUT" | jq -r '.loadgen_log_group_name.value')
 SHUTDOWN_LAMBDA=$(echo "$TF_OUTPUT" | jq -r '.shutdown_lambda_name.value')
 S3_LOCATION=$(echo "$TF_OUTPUT" | jq -r '.metrics_export_location.value')
@@ -101,23 +101,27 @@ echo "  Shutdown Timer:   ${SCHEDULED_MIN} minutes"
 echo "  Run Timestamp:    $RUN_TIMESTAMP"
 echo "  Run Folder:       ${CURRENT_RUN:-unknown}"
 
-# -- 1. ElastiCache Cluster Status --
+# -- 1. MemoryDB Cluster Status --
 echo ""
-echo "=== ElastiCache Cluster ==="
-EC_STATUS=$(aws elasticache describe-replication-groups \
-    --replication-group-id "$CLUSTER_ID" \
+echo "=== MemoryDB Cluster ==="
+# --show-shard-details is what populates Shards[].Nodes[]; without it the
+# per-node AZ and status are absent from the response entirely.
+DB_STATUS=$(aws memorydb describe-clusters \
+    --cluster-name "$CLUSTER_ID" \
+    --show-shard-details \
     --region "$REGION" \
-    --query "ReplicationGroups[0]" \
-    --output json 2>/dev/null) || EC_STATUS=""
+    --query "Clusters[0]" \
+    --output json 2>/dev/null) || DB_STATUS=""
 
-if [[ -n "$EC_STATUS" ]]; then
-    STATUS=$(echo "$EC_STATUS" | jq -r '.Status')
+if [[ -n "$DB_STATUS" ]]; then
+    STATUS=$(echo "$DB_STATUS" | jq -r '.Status')
     echo "  Status: $STATUS"
 
-    echo "$EC_STATUS" | jq -r '.NodeGroups[]? | "    Node Group \(.NodeGroupId): \(.Status)"'
+    echo "$DB_STATUS" | jq -r '.Shards[]? | "    Shard \(.Name): \(.Status) (\(.NumberOfNodes) nodes)"'
 
     if $DETAILED; then
-        echo "$EC_STATUS" | jq -r '.NodeGroups[]?.NodeGroupMembers[]? | "      \(.CacheClusterId) [\(.CurrentRole)] in \(.PreferredAvailabilityZone)"'
+        # AZ is observed, not requested: MemoryDB has no placement argument.
+        echo "$DB_STATUS" | jq -r '.Shards[]?.Nodes[]? | "      \(.Name) [\(.Status)] in \(.AvailabilityZone)"'
     fi
 else
     echo "  Cluster not found or already deleted."
@@ -396,7 +400,7 @@ elif [[ "$EC_ST" == "available" && "$SVC_RUN" -gt 0 ]]; then
 elif [[ "$EC_ST" == "available" && "$SVC_RUN" -eq 0 && "$SVC_DES" -eq 0 ]]; then
     PHASE="SHUTTING DOWN - Tasks stopped, waiting for cleanup"
 elif [[ "$EC_ST" == "deleting" ]]; then
-    PHASE="CLEANUP - ElastiCache cluster being deleted"
+    PHASE="CLEANUP - MemoryDB cluster being deleted"
 elif [[ "${REPORTER_COUNT:-0}" -gt 0 && "$REPORTER_STATUS" != "STOPPED" ]]; then
     PHASE="REPORTING - Current run report generator is running"
 elif [[ "$CURRENT_STATUS_PRESENT" == "true" && "$CURRENT_STATUS_COMPLETE" != "true" ]]; then

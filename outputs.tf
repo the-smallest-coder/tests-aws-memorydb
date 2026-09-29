@@ -1,78 +1,82 @@
-# =============================================================================
-# UNPORTED — copied verbatim from tests-aws-elasticache-redis @ HEAD.
-# This file still targets ElastiCache. See PLAN.md, work package WP1.
-# =============================================================================
-
-output "elasticache_cluster_id" {
-  description = "ElastiCache replication group ID"
-  value       = aws_elasticache_replication_group.main.id
+output "memorydb_cluster_name" {
+  description = "MemoryDB cluster name"
+  value       = aws_memorydb_cluster.main.name
 }
 
-output "elasticache_cluster_arn" {
-  description = "ARN of the ElastiCache replication group"
-  value       = aws_elasticache_replication_group.main.arn
+output "memorydb_cluster_arn" {
+  description = "ARN of the MemoryDB cluster"
+  value       = aws_memorydb_cluster.main.arn
 }
 
-output "elasticache_endpoint" {
-  description = "Primary endpoint for ElastiCache cluster"
-  value = var.cluster_mode_enabled ? aws_elasticache_replication_group.main.configuration_endpoint_address : (
-    aws_elasticache_replication_group.main.primary_endpoint_address
-  )
+# MemoryDB publishes a single cluster endpoint. There is no primary/reader
+# endpoint pair and no configuration-endpoint variant: the cluster is always
+# sharded, so clients discover primaries and replicas through cluster topology
+# and every client must be cluster-aware.
+output "memorydb_endpoint" {
+  description = "Cluster endpoint address for MemoryDB"
+  value       = aws_memorydb_cluster.main.cluster_endpoint[0].address
 }
 
-output "elasticache_reader_endpoint" {
-  description = "Reader endpoint (non-cluster mode with replicas only)"
-  value       = var.cluster_mode_enabled ? null : aws_elasticache_replication_group.main.reader_endpoint_address
+output "memorydb_port" {
+  description = "Port number for MemoryDB"
+  value       = aws_memorydb_cluster.main.cluster_endpoint[0].port
 }
 
-output "elasticache_port" {
-  description = "Port number for ElastiCache"
-  value       = var.port
-}
-
-output "elasticache_connection_string" {
-  description = "Connection string for Redis/Valkey clients"
+output "memorydb_connection_string" {
+  description = "Connection string for Valkey/Redis cluster-aware clients"
   value = format("%s:%d",
-    var.cluster_mode_enabled ? aws_elasticache_replication_group.main.configuration_endpoint_address : aws_elasticache_replication_group.main.primary_endpoint_address,
-  var.port)
+    aws_memorydb_cluster.main.cluster_endpoint[0].address,
+  aws_memorydb_cluster.main.cluster_endpoint[0].port)
+}
+
+output "memorydb_tls_enabled" {
+  description = "Whether the cluster requires TLS. Defaults to true on MemoryDB, so clients must pass --tls."
+  value       = aws_memorydb_cluster.main.tls_enabled
+}
+
+output "memorydb_acl_name" {
+  description = "ACL attached to the cluster"
+  value       = aws_memorydb_cluster.main.acl_name
 }
 
 output "security_group_id" {
-  description = "ID of the ElastiCache security group"
-  value       = aws_security_group.elasticache.id
+  description = "ID of the MemoryDB security group"
+  value       = aws_security_group.memorydb.id
 }
 
 output "subnet_group_name" {
-  description = "Name of the ElastiCache subnet group"
-  value       = aws_elasticache_subnet_group.main.name
+  description = "Name of the MemoryDB subnet group"
+  value       = aws_memorydb_subnet_group.main.name
 }
 
-output "cloudwatch_log_group_name" {
-  description = "CloudWatch log group name for ElastiCache logs"
-  value       = aws_cloudwatch_log_group.elasticache.name
-}
+# No cloudwatch_log_group_name output: MemoryDB has no log-delivery
+# configuration, so there is no slow-log or engine-log group to point at.
 
 output "cloudwatch_dashboard_url" {
   description = "URL to CloudWatch dashboard"
   value = var.enable_cloudwatch_dashboard ? format(
     "https://console.aws.amazon.com/cloudwatch/home?region=%s#dashboards:name=%s",
     var.aws_region,
-    aws_cloudwatch_dashboard.elasticache[0].dashboard_name
+    aws_cloudwatch_dashboard.memorydb[0].dashboard_name
   ) : null
 }
 
 output "configuration_summary" {
   description = "Summary of applied configuration"
   value = {
-    engine              = var.engine_type
-    engine_version      = var.engine_version
-    node_type           = var.node_type
-    cluster_mode        = var.cluster_mode_enabled
-    num_nodes_or_shards = var.cluster_mode_enabled ? var.num_node_groups : var.num_cache_nodes
-    replicas_per_shard  = var.cluster_mode_enabled ? var.replicas_per_node_group : (var.num_cache_nodes > 1 ? var.num_cache_nodes - 1 : 0)
-    encryption_at_rest  = var.at_rest_encryption_enabled
-    encryption_transit  = var.transit_encryption_enabled
-    automatic_failover  = var.automatic_failover_enabled
+    engine                 = var.engine_type
+    engine_version         = var.engine_version
+    node_type              = var.node_type
+    num_shards             = var.num_shards
+    num_replicas_per_shard = var.num_replicas_per_shard
+    node_count             = local.memorydb_node_count
+    acl_name               = var.acl_name
+    tls_enabled            = var.tls_enabled
+    data_tiering           = var.data_tiering
+    # Not reported because MemoryDB does not make them optional: encryption at
+    # rest is always on, the cluster is always multi-AZ with automatic
+    # failover, and AZ placement cannot be requested. Placement that actually
+    # happened is recorded per node in cluster_details.json instead.
   }
 }
 

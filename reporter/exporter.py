@@ -14,13 +14,14 @@ from datetime import datetime, timezone
 
 import boto3
 
+import metric_source
 from report_generator import run_uploaded_report
 
 
 # The full CloudWatch Statistic enum (5 members, no 6th exists) -- SampleCount
 # makes duplicated percentile columns self-identifying: SampleCount == 1
 # means the ExtendedStatistics value for that datapoint equals the raw value
-# by construction, not a coincidence. See PLAN_2.md WP2 change 3.
+# by construction, not a coincidence.
 STATISTICS = ["SampleCount", "Average", "Sum", "Minimum", "Maximum"]
 # Requested for every discovered metric, not a curated subset (D8): in one
 # get_metric_statistics call, percentiles cost rows, not API calls. p99 is
@@ -29,26 +30,34 @@ DEFAULT_EXTENDED_STATISTICS = ["p99"]
 CLIENT_LATENCY_PERCENTILES = ["p50", "p99", "p99.9"]
 LOG_EXPORT_PART_SIZE = 6 * 1024 * 1024
 
-# WP2: this list no longer drives what gets fetched (discovery does, via
-# list_metrics with no metric_names filter) -- it's now half of what
-# "complete" means: names that must be present regardless of topology. See
-# CORE_ELASTICACHE_CONTRACT_METRICS and conditional_elasticache_metric_contract().
-REQUIRED_ELASTICACHE_METRICS = [
-    "CacheHitRate",
-    "CacheHits",
-    "CacheMisses",
+# This list no longer drives what gets fetched (discovery does, via
+# list_metrics with no metric_names filter) -- it is half of what "complete"
+# means: names that must be present regardless of topology. See
+# CORE_MEMORYDB_CONTRACT_METRICS and conditional_memorydb_metric_contract().
+#
+# Rewritten for MemoryDB rather than filtered. Seven metrics the source
+# project required do not exist here at all (CacheHitRate,
+# GetTypeCmdsLatency, SetTypeCmdsLatency, StringBasedCmdsLatency,
+# DatabaseMemoryUsageCountedForEvictPercentage,
+# DatabaseCapacityUsageCountedForEvictPercentage, TrafficManagementActive).
+# Leaving them in would report them "missing" on every healthy run, and a
+# contract that is always failing is a contract people stop reading.
+#
+# The host-level names (FreeableMemory, Network*, SwapUsage) were confirmed
+# published for MemoryDB by list-metrics on a live cluster under load
+# (2026-09-29), so they are required like the rest.
+REQUIRED_MEMORYDB_METRICS = [
     "CPUUtilization",
     "CurrConnections",
     "CurrItems",
-    "DatabaseCapacityUsageCountedForEvictPercentage",
     "DatabaseCapacityUsagePercentage",
-    "DatabaseMemoryUsageCountedForEvictPercentage",
     "DatabaseMemoryUsagePercentage",
     "EngineCPUUtilization",
     "Evictions",
     "FreeableMemory",
     "GetTypeCmds",
-    "GetTypeCmdsLatency",
+    metric_source.KEYSPACE_HITS,
+    metric_source.KEYSPACE_MISSES,
     "MemoryFragmentationRatio",
     "NetworkBandwidthInAllowanceExceeded",
     "NetworkBandwidthOutAllowanceExceeded",
@@ -58,9 +67,7 @@ REQUIRED_ELASTICACHE_METRICS = [
     "NetworkPacketsPerSecondAllowanceExceeded",
     "NewConnections",
     "SetTypeCmds",
-    "SetTypeCmdsLatency",
     "StringBasedCmds",
-    "StringBasedCmdsLatency",
     "SwapUsage",
 ]
 
@@ -83,7 +90,7 @@ REQUIRED_ECS_METRICS = [
 ]
 
 ECS_CLIENT_LATENCY_METRIC = {
-    "namespace": "ElastiCache/LoadGenerator",
+    "namespace": metric_source.LOADGEN_NAMESPACE,
     "metric_name": "ClientLatency",
     "dimensions": ("ClusterName", "ServiceName", "TaskId"),
     "stats": CLIENT_LATENCY_PERCENTILES,
@@ -91,34 +98,30 @@ ECS_CLIENT_LATENCY_METRIC = {
 }
 
 REPORT_CONTRACT_METRICS = [
-    "CacheHits",
-    "CacheMisses",
+    metric_source.KEYSPACE_HITS,
+    metric_source.KEYSPACE_MISSES,
+    metric_source.BYTES_USED,
     "CurrConnections",
     "CurrItems",
-    "DatabaseCapacityUsageCountedForEvictPercentage",
-    "DatabaseMemoryUsageCountedForEvictPercentage",
     "EngineCPUUtilization",
-    "Evictions",
-    "FreeableMemory",
-    "GetTypeCmdsLatency",
-    "SetTypeCmdsLatency",
-    "StringBasedCmdsLatency",
-    # WP2: made available by discovery; confirmed published for valkey (the
-    # tested engine) before being added here -- redis is unconfirmed on the
-    # available runs, but the contract is per-run (D8), so an unconfirmed
-    # engine just surfaces as `missing`, not a crash.
-    "TrafficManagementActive",
     "ErrorCount",
-    "SuccessfulReadRequestLatency",
-    "SuccessfulWriteRequestLatency",
+    "Evictions",
+    # MemoryDB's replacement for the three *CmdsLatency metrics. Engine-gated:
+    # Valkey 7.2+ only, absent on Redis OSS, which is why valkey is the
+    # default engine -- conditional_memorydb_metric_contract() drops the pair
+    # for runs that cannot publish it. Reported as two separate figures, never
+    # blended -- see metric_source for why.
+    metric_source.READ_LATENCY,
+    metric_source.WRITE_LATENCY,
 ]
 
 # D8: the completeness contract is conditional on topology, not a fixed list.
-# This is the part that never varies; conditional_elasticache_metric_contract()
-# adds burstable-credit and replication names only when the topology has them.
-CORE_ELASTICACHE_CONTRACT_METRICS = sorted(set(REQUIRED_ELASTICACHE_METRICS) | set(REPORT_CONTRACT_METRICS))
+# This is the part that never varies; conditional_memorydb_metric_contract()
+# adds burstable-credit, replication and data-tiering names only when the
+# topology has them.
+CORE_MEMORYDB_CONTRACT_METRICS = sorted(set(REQUIRED_MEMORYDB_METRICS) | set(REPORT_CONTRACT_METRICS))
 
-BURSTABLE_NODE_TYPE_PREFIXES = ("cache.t2.", "cache.t3.", "cache.t4g.")
+BURSTABLE_NODE_TYPE_PREFIXES = ("db.t4g.",)
 
 
 class _LazyBoto3Client:
@@ -135,7 +138,7 @@ class _LazyBoto3Client:
 cloudwatch = _LazyBoto3Client("cloudwatch")
 logs = _LazyBoto3Client("logs")
 s3 = _LazyBoto3Client("s3")
-elasticache = _LazyBoto3Client("elasticache")
+memorydb = _LazyBoto3Client("memorydb")
 
 
 def _env_int(name: str, default: int) -> int:
@@ -195,19 +198,21 @@ def _list_log_stream_names(log_group: str) -> list[str]:
     return sorted(dict.fromkeys(streams))
 
 
-def _fallback_member_clusters(replication_group_id: str) -> list[str]:
-    cluster_mode = os.environ.get("CLUSTER_MODE", "false").strip().lower() == "true"
-    if cluster_mode:
-        node_groups = max(_env_int("NUM_NODE_GROUPS", 1), 1)
-        replicas = max(_env_int("REPLICAS_PER_NODE_GROUP", 0), 0)
-        return [
-            f"{replication_group_id}-{node_group:04d}-{replica:03d}"
-            for node_group in range(1, node_groups + 1)
-            for replica in range(1, replicas + 2)
-        ]
+def _fallback_node_ids(cluster_name: str) -> list[str]:
+    """Derive this cluster's node IDs when describe_clusters is unavailable.
 
-    num_nodes = max(_env_int("NUM_CACHE_NODES", 1), 1)
-    return [f"{replication_group_id}-{node:03d}" for node in range(1, num_nodes + 1)]
+    MemoryDB names nodes {cluster}-{shard:04d}-{node:03d}, and every cluster is
+    sharded, so there is no second naming scheme to branch on the way the
+    ElastiCache original did. Node 001 of each shard is the primary; the rest
+    are its replicas.
+    """
+    shards = max(_env_int("NUM_SHARDS", 1), 1)
+    replicas = max(_env_int("NUM_REPLICAS_PER_SHARD", 0), 0)
+    return [
+        f"{cluster_name}-{shard:04d}-{node:03d}"
+        for shard in range(1, shards + 1)
+        for node in range(1, replicas + 2)
+    ]
 
 
 def _list_metrics(namespace: str, filter_dimensions=None, metric_name_filter=None) -> list[dict]:
@@ -259,28 +264,59 @@ def _as_int_or_none(value) -> int | None:
         return None
 
 
-def conditional_elasticache_metric_contract(cluster_details: dict | None) -> list[str]:
-    """The ElastiCache metric names this run's topology must publish (D8).
+def _publishes_server_latency(memorydb: dict) -> bool:
+    """Whether this run's engine publishes Successful{Read,Write}RequestLatency.
 
-    Not a fixed list: burstable node types add the CPU credit pair, and
-    multi-node / replicated / cluster-mode topologies add replication
-    metrics. A metric absent because this topology doesn't apply to it is
-    not `missing` -- only conditional_elasticache_metric_contract() deciding
-    it doesn't apply, and metric_export.missing_from_discovery then not
-    naming it, makes that distinction instead of a hardcoded metric count.
+    Only Valkey 7.2+ does. False only when cluster_details says so outright
+    (Redis OSS, or Valkey below 7.2): an engine or version this cannot read
+    keeps the pair in the contract, so a gap surfaces as `missing` rather than
+    being defined away.
     """
-    elasticache = (cluster_details or {}).get("elasticache") or {}
-    contract = set(CORE_ELASTICACHE_CONTRACT_METRICS)
+    engine = str(memorydb.get("engine") or "").strip().lower()
+    if engine == "redis":
+        return False
+    if engine != "valkey":
+        return True
+    version = str(memorydb.get("engine_patch_version") or memorydb.get("engine_version_configured") or "")
+    match = re.match(r"\s*(\d+)\.(\d+)", version)
+    if not match:
+        return True
+    return (int(match.group(1)), int(match.group(2))) >= (7, 2)
 
-    node_type = str(elasticache.get("node_type") or "")
+
+def conditional_memorydb_metric_contract(cluster_details: dict | None) -> list[str]:
+    """The MemoryDB metric names this run's topology must publish.
+
+    Not a fixed list: burstable node types add the CPU credit pair, a cluster
+    with replicas adds the replication family, and a data-tiering cluster adds
+    the disk family, while an engine without server-side latency metrics
+    (Redis OSS, Valkey below 7.2) drops that pair. A metric absent because
+    this topology does not apply to it is not `missing` -- this function
+    deciding it does not apply, and metric_export.missing_from_discovery then
+    not naming it, is what makes that distinction rather than a hardcoded
+    metric count.
+    """
+    memorydb = (cluster_details or {}).get("memorydb") or {}
+    contract = set(CORE_MEMORYDB_CONTRACT_METRICS)
+
+    if not _publishes_server_latency(memorydb):
+        contract -= {metric_source.READ_LATENCY, metric_source.WRITE_LATENCY}
+
+    node_type = str(memorydb.get("node_type") or "")
     if node_type.startswith(BURSTABLE_NODE_TYPE_PREFIXES):
         contract |= {"CPUCreditBalance", "CPUCreditUsage"}
 
-    num_cache_nodes = _as_int_or_none(elasticache.get("num_cache_nodes"))
-    replicas_per_node_group = _as_int_or_none(elasticache.get("replicas_per_node_group"))
-    has_replicas = (num_cache_nodes or 0) > 1 or (replicas_per_node_group or 0) > 0
-    if _is_true(elasticache.get("cluster_mode_enabled")) or has_replicas:
-        contract |= {"ReplicationLag", "ReplicationBytes", "MasterLinkHealthStatus"}
+    # MemoryDB is always sharded, so there is no cluster-mode condition here --
+    # only whether this cluster has replicas to replicate to. num_shards alone
+    # does not produce replication traffic.
+    replicas_per_shard = _as_int_or_none(memorydb.get("num_replicas_per_shard"))
+    if (replicas_per_shard or 0) > 0:
+        contract |= set(metric_source.REPLICATION_METRICS)
+
+    # Data tiering is fixed at create time and only exists on r6gd nodes. The
+    # disk metric family and the Tier dimension appear together or not at all.
+    if _is_true(memorydb.get("data_tiering")):
+        contract |= set(metric_source.DATA_TIERING_METRICS)
 
     return sorted(contract)
 
@@ -292,7 +328,7 @@ def _metric_contract_status(discovered_names, cluster_details: dict | None) -> d
     list_metrics actually returned during this export -- old runs are never
     retroactively re-scored against a later contract.
     """
-    contract = conditional_elasticache_metric_contract(cluster_details)
+    contract = conditional_memorydb_metric_contract(cluster_details)
     missing = sorted(set(contract) - set(discovered_names))
     return {"complete": not missing, "missing": missing}
 
@@ -314,7 +350,7 @@ def _is_validation_exception(exc: Exception) -> bool:
     """True for CloudWatch's "Statistics or ExtendedStatistics, not both" error.
 
     The service model declares this restriction but the live API accepts and
-    returns both together (confirmed twice independently, see PLAN_2.md WP2
+    returns both together (confirmed twice independently against the source
     change 4). This detects the documented behavior in case AWS ever
     enforces it, so the fallback below only fires when actually needed.
     """
@@ -395,7 +431,7 @@ def export_metric_sources_to_s3(
     zero_datapoint_names: set[str] = set()
     errors: list[dict] = []
     # Diagnostic only (never gates completeness -- see the value_failures
-    # comment on export_elasticache_metrics_to_s3's return below): whether
+    # comment on export_memorydb_metrics_to_s3's return below): whether
     # the cluster's actual read/write activity metrics carry any signal,
     # tracked from datapoints already being written into the CSV anyway.
     cache_ops_sum = 0.0
@@ -447,7 +483,7 @@ def export_metric_sources_to_s3(
                 if stat in datapoint:
                     writer.writerow([ts, namespace, metric_name, stat, datapoint[stat], unit, output_dimensions_str])
                     rows_written += 1
-                    if metric_name in ("CacheHits", "CacheMisses") and stat == "Sum":
+                    if metric_name in (metric_source.KEYSPACE_HITS, metric_source.KEYSPACE_MISSES) and stat == "Sum":
                         cache_ops_sum += datapoint[stat]
                     elif metric_name == "CurrItems" and stat == "Maximum":
                         curr_items_max = max(curr_items_max, datapoint[stat])
@@ -472,41 +508,69 @@ def export_metric_sources_to_s3(
     return f"s3://{bucket}/{key}", stats
 
 
-def export_elasticache_metrics_to_s3(
-    replication_group_id, bucket, key, start_time, end_time, cluster_details: dict | None = None
+def export_memorydb_metrics_to_s3(
+    cluster_name, bucket, key, start_time, end_time, cluster_details: dict | None = None
 ) -> dict:
-    # No metric_names (D8, WP2 change 1): list_metrics returns whatever AWS
-    # actually publishes for these dimensions, so the export adapts itself
-    # instead of going stale the moment AWS ships a new ElastiCache metric.
+    # No metric_names: list_metrics returns whatever AWS actually publishes for
+    # these dimensions, so the export adapts itself instead of going stale the
+    # moment AWS ships a new MemoryDB metric. This is the source project's best
+    # idea and it carries over unchanged.
     sources = [
         {
-            "namespace": "AWS/ElastiCache",
-            "dimensions": [{"Name": "ReplicationGroupId", "Value": replication_group_id}],
-        }
+            # Returns every series that carries ClusterName: the cluster-level
+            # aggregate of each metric and each node's ClusterName+NodeName
+            # series.
+            "namespace": metric_source.NAMESPACE,
+            "dimensions": [
+                {"Name": metric_source.CLUSTER_DIMENSION, "Value": cluster_name}
+            ],
+        },
+        {
+            # EngineCPUUtilization is also published under ReplicationGroupId
+            # (alone, with Role, and with NodeGroupId) without ClusterName, so
+            # the source above never returns those series.
+            "namespace": metric_source.NAMESPACE,
+            "dimensions": [
+                {"Name": metric_source.REPLICATION_GROUP_DIMENSION, "Value": cluster_name}
+            ],
+        },
     ]
 
-    member_clusters = []
+    node_ids = []
     try:
-        response = elasticache.describe_replication_groups(ReplicationGroupId=replication_group_id)
-        for group in response.get("ReplicationGroups", []):
-            member_clusters = group.get("MemberClusters", [])
+        response = memorydb.describe_clusters(ClusterName=cluster_name, ShowShardDetails=True)
+        for cluster in response.get("Clusters", []):
+            for shard in cluster.get("Shards", []):
+                for node in shard.get("Nodes", []):
+                    name = node.get("Name")
+                    if name:
+                        node_ids.append(name)
     except Exception as exc:
-        print(f"Describe replication group unavailable, using derived node IDs: {exc}")
+        print(f"describe_clusters unavailable, using derived node IDs: {exc}")
 
-    member_clusters = list(dict.fromkeys(member_clusters or []))
-    for cluster_id in _fallback_member_clusters(replication_group_id):
-        if cluster_id not in member_clusters:
-            member_clusters.append(cluster_id)
+    node_ids = list(dict.fromkeys(node_ids or []))
+    for node_id in _fallback_node_ids(cluster_name):
+        if node_id not in node_ids:
+            node_ids.append(node_id)
 
-    for cluster_id in member_clusters:
+    # Node-level metrics need BOTH dimensions. On ElastiCache the node
+    # dimension was self-sufficient; here, querying NodeName alone returns
+    # nothing at all -- silently, as an empty result rather than an error.
+    # The ClusterName source above already returns these series; listing each
+    # node explicitly as well keeps a node's series even if that listing is
+    # ever cut short.
+    for node_id in node_ids:
         sources.append(
             {
-                "namespace": "AWS/ElastiCache",
-                "dimensions": [{"Name": "CacheClusterId", "Value": cluster_id}],
+                "namespace": metric_source.NAMESPACE,
+                "dimensions": [
+                    {"Name": metric_source.CLUSTER_DIMENSION, "Value": cluster_name},
+                    {"Name": metric_source.NODE_DIMENSION, "Value": node_id},
+                ],
             }
         )
 
-    print(f"ElastiCache metric sources: {[s['dimensions'] for s in sources]}")
+    print(f"MemoryDB metric sources: {[s['dimensions'] for s in sources]}")
     uri, stats = export_metric_sources_to_s3(sources, bucket, key, start_time, end_time)
     contract_status = _metric_contract_status(stats["discovered"], cluster_details)
     # Informational only, like missing_from_discovery above -- never folded
@@ -520,7 +584,10 @@ def export_elasticache_metrics_to_s3(
     # back empty" -- rows_written > 0 alone can't distinguish those.
     value_failures = []
     if stats["cache_ops_sum"] <= 0:
-        value_failures.append("CacheHits/CacheMisses have no positive Sum datapoints")
+        value_failures.append(
+            f"{metric_source.KEYSPACE_HITS}/{metric_source.KEYSPACE_MISSES}"
+            " have no positive Sum datapoints"
+        )
     if stats["curr_items_max"] <= 0:
         value_failures.append("CurrItems has no positive Maximum datapoints")
     return {
@@ -938,7 +1005,7 @@ def _ses_config():
     identity = arn_match.group(2)
     return {
         "client": boto3.client("ses", region_name=arn_match.group(1)),
-        "source": identity if "@" in identity else f"aws-elasticache-lab@{identity}",
+        "source": identity if "@" in identity else f"aws-memorydb-lab@{identity}",
         "to": email,
     }
 
@@ -954,7 +1021,7 @@ def send_report_ready_email(cluster_id: str, report_uri: str, summary_uri: str, 
     summary_html = html.escape(summary_uri, quote=True)
     s3_html = html.escape(f"s3://{bucket}/{prefix}{timestamp}/", quote=True)
     body_text = (
-        "ElastiCache report ready.\n\n"
+        "MemoryDB report ready.\n\n"
         f"Cluster: {cluster_id}\n"
         f"Report: {report_uri}\n"
         f"Summary: {summary_uri}\n"
@@ -979,7 +1046,7 @@ def send_report_ready_email(cluster_id: str, report_uri: str, summary_uri: str, 
         Source=config["source"],
         Destination={"ToAddresses": [config["to"]]},
         Message={
-            "Subject": {"Data": f"[ElastiCache Report Ready] {cluster_id}", "Charset": "UTF-8"},
+            "Subject": {"Data": f"[MemoryDB Report Ready] {cluster_id}", "Charset": "UTF-8"},
             "Body": {
                 "Text": {"Data": body_text, "Charset": "UTF-8"},
                 "Html": {"Data": body_html, "Charset": "UTF-8"},
@@ -994,7 +1061,10 @@ _TRACKED_PIP_PACKAGES = ("boto3", "pandas", "plotly")
 
 
 def _parse_pip_freeze(text: str) -> dict[str, str]:
-    """Extract {package: version} for the reporter's pinned dependencies.
+    """Extract {package: version} for the reporter's direct dependencies.
+
+    Those are installed unpinned (latest on every run -- see reporter.tf), so
+    this is the only record of which versions a given report was built with.
 
     Only the three tracked packages are kept -- `pip freeze` also lists every
     transitive dependency, which is provenance noise for this purpose (the
@@ -1010,7 +1080,7 @@ def _parse_pip_freeze(text: str) -> dict[str, str]:
 
 def main() -> None:
     cluster_id = os.environ["CLUSTER_ID"]
-    elasticache_id = os.environ.get("ELASTICACHE_ID", cluster_id)
+    memorydb_cluster_name = os.environ.get("MEMORYDB_CLUSTER_NAME", cluster_id)
     ecs_cluster = os.environ["ECS_CLUSTER"]
     ecs_service = os.environ["ECS_SERVICE"]
     bucket = os.environ["S3_BUCKET"]
@@ -1058,7 +1128,7 @@ def main() -> None:
 
     # cluster_details.json is already the rich Terraform artifact by this
     # point (WP0 -- exporter never writes it); read it directly so the
-    # ElastiCache completeness contract can size itself to this run's actual
+    # MemoryDB completeness contract can size itself to this run's actual
     # topology (D8) instead of a hardcoded metric list.
     cluster_details_key = f"{prefix}{timestamp}/cluster_details.json"
     try:
@@ -1072,21 +1142,21 @@ def main() -> None:
     # have nothing to do with either number (a slow Container Insights log
     # read must not read as a metric-export slowdown, or vice versa).
     metric_export_start = time.monotonic()
-    elasticache_manifest = export_elasticache_metrics_to_s3(
-        elasticache_id, bucket, metrics_key, start_time, end_time, cluster_details=cluster_details
+    memorydb_manifest = export_memorydb_metrics_to_s3(
+        memorydb_cluster_name, bucket, metrics_key, start_time, end_time, cluster_details=cluster_details
     )
     metric_export_duration_seconds = time.monotonic() - metric_export_start
 
-    status["metric_export"] = elasticache_manifest
+    status["metric_export"] = memorydb_manifest
     # Not a cost figure (D11): the export step's own runtime, recorded so a
     # growing metric set that stops finishing before the cluster is torn
     # down becomes visible instead of silently losing data (WP2 exit
     # condition 5).
     status["metric_export_timing"] = {
         "duration_seconds": round(metric_export_duration_seconds, 3),
-        "rows_written": elasticache_manifest.get("rows_written"),
+        "rows_written": memorydb_manifest.get("rows_written"),
     }
-    # checks.metrics deliberately does NOT gate on elasticache_manifest's own
+    # checks.metrics deliberately does NOT gate on memorydb_manifest's own
     # "complete" (discovered ⊇ the conditional D8 contract): that check is
     # topology-wide (~30 names) and meant for human review after the fact
     # (WP2 exit condition: "missing_from_discovery is empty, OR every name
@@ -1098,9 +1168,9 @@ def main() -> None:
     # that actually blocks report generation stays narrow and genuinely
     # about data presence: did the export come back with real rows at all.
     status["checks"]["metrics"] = {
-        "complete": elasticache_manifest.get("rows_written", 0) > 0,
-        "rows_written": elasticache_manifest.get("rows_written", 0),
-        "errors": elasticache_manifest.get("errors", []),
+        "complete": memorydb_manifest.get("rows_written", 0) > 0,
+        "rows_written": memorydb_manifest.get("rows_written", 0),
+        "errors": memorydb_manifest.get("errors", []),
     }
 
     export_logs_to_s3(
@@ -1121,13 +1191,9 @@ def main() -> None:
         task_metadata=task_metadata,
     )
 
-    export_logs_to_s3(
-        os.environ.get("ELASTICACHE_LOG_GROUP"),
-        bucket,
-        f"{prefix}{timestamp}/logs/elasticache/{cluster_id}.txt",
-        start_time,
-        end_time,
-    )
+    # No cluster log export: MemoryDB has no log-delivery configuration, so
+    # there is no slow-log or engine-log group to read. This is a real gap
+    # versus the ElastiCache project, not an oversight.
     export_logs_to_s3(
         os.environ.get("LAMBDA_SCHEDULER_LOG_GROUP"),
         bucket,
@@ -1179,7 +1245,7 @@ def main() -> None:
     # cluster_details.json is written once, at apply time, by node_details.tf.
     # The exporter must never write to that key: doing so would overwrite the
     # rich Terraform artifact with a thin subset of the same fields sourced
-    # from env vars, which is strictly less information. See PLAN_2.md WP0.
+    # from env vars, which is strictly less information.
     status["cluster_details"] = run_uploaded_report()
 
     report_uri = f"s3://{bucket}/{prefix}{timestamp}/results_{timestamp}.html"

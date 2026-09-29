@@ -1,6 +1,3 @@
-# UNPORTED — copied from tests-aws-elasticache-redis @ HEAD.
-# Still uses the elasticache boto3 client. See PLAN.md work package WP4.
-
 import json
 import os
 
@@ -8,7 +5,7 @@ import boto3
 
 
 ecs = boto3.client("ecs")
-elasticache = boto3.client("elasticache")
+memorydb = boto3.client("memorydb")
 
 
 def handler(event, context):
@@ -23,12 +20,12 @@ def handler(event, context):
     cluster_id = os.environ["CLUSTER_ID"]
     ecs_cluster = os.environ["ECS_CLUSTER"]
     ecs_service = os.environ["ECS_SERVICE"]
-    elasticache_id = os.environ["ELASTICACHE_ID"]
+    memorydb_cluster_name = os.environ["MEMORYDB_CLUSTER_NAME"]
 
     results = {
         "cluster_id": cluster_id,
         "ecs_stopped": False,
-        "elasticache_stopped": False,
+        "memorydb_stopped": False,
     }
 
     try:
@@ -44,20 +41,20 @@ def handler(event, context):
         results["ecs_stopped"] = str(exc)
 
     try:
-        delete_params = {
-            "ReplicationGroupId": elasticache_id,
-            "RetainPrimaryCluster": False,
-        }
-        final_snapshot_id = os.environ.get("ELASTICACHE_FINAL_SNAPSHOT_ID")
-        if final_snapshot_id:
-            delete_params["FinalSnapshotIdentifier"] = final_snapshot_id
+        # MemoryDB's delete_cluster has no RetainPrimaryCluster equivalent --
+        # deleting the cluster deletes every shard and replica with it. The
+        # snapshot parameter is FinalSnapshotName, not FinalSnapshotIdentifier.
+        delete_params = {"ClusterName": memorydb_cluster_name}
+        final_snapshot_name = os.environ.get("MEMORYDB_FINAL_SNAPSHOT_NAME")
+        if final_snapshot_name:
+            delete_params["FinalSnapshotName"] = final_snapshot_name
 
-        elasticache.delete_replication_group(**delete_params)
-        results["elasticache_stopped"] = True
-        print(f"ElastiCache {elasticache_id} delete initiated")
+        memorydb.delete_cluster(**delete_params)
+        results["memorydb_stopped"] = True
+        print(f"MemoryDB {memorydb_cluster_name} delete initiated")
     except Exception as exc:
-        print(f"ElastiCache delete note: {exc}")
-        results["elasticache_stopped"] = str(exc)
+        print(f"MemoryDB delete note: {exc}")
+        results["memorydb_stopped"] = str(exc)
 
     print("Shutdown commands issued. Verification will handle export/report handoff.")
     return {

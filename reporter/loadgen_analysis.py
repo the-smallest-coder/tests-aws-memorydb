@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from helpers import elasticache_availability_zone, ecs_task_index_map, ecs_task_metric_rows
+from helpers import memorydb_availability_zone, ecs_task_index_map, ecs_task_metric_rows
 
 
 GENERATOR_CPU_THRESHOLD_PCT = 85.0
@@ -146,7 +146,7 @@ def build_loadgen_summary(
     ci_service_df: pd.DataFrame,
     report_start,
     report_end,
-    measured_elasticache_az=None,
+    measured_memorydb_az=None,
     memtier_totals_df: pd.DataFrame | None = None,
     requested_task_count=None,
 ) -> dict:
@@ -171,7 +171,7 @@ def build_loadgen_summary(
     # Kept under its original name (report_compare.METRICS and README both
     # reference "expected_task_count"); observed_task_count is the same
     # value under a name that doesn't conflate "expected" with "requested"
-    # -- the confusion WP5 exists to resolve (PLAN_2.md WP5). Unlike
+    # -- the confusion this function exists to resolve. Unlike
     # observed_task_count, this preserves the original never-None guarantee
     # (stream_count is >= 1 whenever samples is non-empty, as it is here) --
     # code below still divides/compares against it unconditionally.
@@ -260,10 +260,10 @@ def build_loadgen_summary(
                 }
             )
 
-    elasticache_az = elasticache_availability_zone(
+    memorydb_az = memorydb_availability_zone(
         task_latency_map=_task_latency_map(memtier_totals_df),
         task_az_map=az_by_task,
-        measured_availability_zone=measured_elasticache_az,
+        measured_availability_zone=measured_memorydb_az,
     )
     task_indexes = ecs_task_index_map(
         {
@@ -271,7 +271,7 @@ def build_loadgen_summary(
             for row in cpu_vector + throughput_vector
         },
         task_az_map=az_by_task,
-        elasticache_az=elasticache_az['availability_zone'],
+        memorydb_az=memorydb_az['availability_zone'],
     )
     for vector in (cpu_vector, throughput_vector):
         for row in vector:
@@ -287,7 +287,7 @@ def build_loadgen_summary(
         fleet_ratio = _ratio_p90_p10(throughput_df["median_ops_sec"])
         az_groups = list(throughput_df.groupby("availability_zone", sort=True))
         az_groups.sort(key=lambda item: (
-            0 if item[0] == elasticache_az['availability_zone'] else 1,
+            0 if item[0] == memorydb_az['availability_zone'] else 1,
             item[0] == 'unknown',
             item[0],
         ))
@@ -343,9 +343,9 @@ def build_loadgen_summary(
     unknown_reasons = []
     if missing_az_tasks:
         unknown_reasons.append("availability_zone_missing")
-    if elasticache_az["source"] == "unavailable":
+    if memorydb_az["source"] == "unavailable":
         unknown_reasons.append("elasticache_availability_zone_unavailable")
-    elif elasticache_az["source"] == "ambiguous":
+    elif memorydb_az["source"] == "ambiguous":
         unknown_reasons.append("elasticache_availability_zone_ambiguous")
 
     has_cpu = generator_cpu_p95 is not None
@@ -360,7 +360,7 @@ def build_loadgen_summary(
     )
     # `status` used to be "invalid"/"valid" with reasons under
     # "invalid_reasons"; a run over the generator-CPU/within-AZ-skew
-    # thresholds does not invalidate the ElastiCache-side result, only ECS
+    # thresholds does not invalidate the MemoryDB-side result, only ECS
     # task latency conclusions (see latency_tail_valid below), so this was
     # renamed to "warning"/"ok" with reasons under "warning_reasons".
     # `diagnostic_status` was added as the new canonical name at the same
@@ -389,8 +389,8 @@ def build_loadgen_summary(
         "generator_cpu_limited": generator_limited if has_cpu else None,
         "generator_cpu_across_tasks": generator_cpu_across_tasks,
         "generator_cpu_p95_by_task": cpu_vector,
-        "elasticache_availability_zone": elasticache_az["availability_zone"],
-        "elasticache_availability_zone_source": elasticache_az["source"],
+        "elasticache_availability_zone": memorydb_az["availability_zone"],
+        "elasticache_availability_zone_source": memorydb_az["source"],
         "throughput_task_skew_p90_to_p10": _rounded(fleet_ratio),
         "throughput_skew_within_az_max": _rounded(within_az_max),
         "throughput_skew_within_az_threshold": WITHIN_AZ_SKEW_THRESHOLD,

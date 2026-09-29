@@ -14,7 +14,7 @@ class ClientLatencyReportTests(unittest.TestCase):
     def _latency_row(timestamp, stat, value, dimensions):
         return {
             "Timestamp": timestamp,
-            "Namespace": "ElastiCache/LoadGenerator",
+            "Namespace": "MemoryDB/LoadGenerator",
             "MetricName": "ClientLatency",
             "Stat": stat,
             "Value": value,

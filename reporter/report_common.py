@@ -283,26 +283,37 @@ def enrich_summary_meta(summary: dict[str, Any], cluster_details: dict[str, Any]
     if not cluster_details:
         return
 
-    elasticache = cluster_details.get("elasticache", {})
+    memorydb = cluster_details.get("memorydb", {})
     run_info = cluster_details.get("run", {})
     memtier = cluster_details.get("memtier", {})
 
     meta["cluster_id"] = meta.get("cluster_id") or run_info.get("cluster_id") or ""
-    meta["engine_type"] = meta.get("engine_type") or elasticache.get("engine") or ""
-    meta["engine_version"] = meta.get("engine_version") or elasticache.get("engine_version_configured") or ""
-    meta["node_type"] = meta.get("node_type") or elasticache.get("node_type") or ""
-    meta["node_memory_bytes"] = meta.get("node_memory_bytes") or elasticache.get("node_memory_bytes") or ""
-    meta["node_hourly_usd"] = meta.get("node_hourly_usd") or elasticache.get("node_hourly_usd") or ""
-    meta["node_hourly_usd_source"] = meta.get("node_hourly_usd_source") or elasticache.get("node_hourly_usd_source") or ""
-    meta["node_hourly_usd_reason"] = meta.get("node_hourly_usd_reason") or elasticache.get("node_hourly_usd_reason") or ""
-    meta["node_count"] = meta.get("node_count") or elasticache.get("num_cache_nodes") or ""
-    if not meta.get("cluster_mode"):
-        meta["cluster_mode"] = elasticache.get("cluster_mode_enabled")
+    meta["engine_type"] = meta.get("engine_type") or memorydb.get("engine") or ""
+    meta["engine_version"] = meta.get("engine_version") or memorydb.get("engine_version_configured") or ""
+    meta["node_type"] = meta.get("node_type") or memorydb.get("node_type") or ""
+    meta["node_memory_bytes"] = meta.get("node_memory_bytes") or memorydb.get("node_memory_bytes") or ""
+    meta["node_hourly_usd"] = meta.get("node_hourly_usd") or memorydb.get("node_hourly_usd") or ""
+    meta["node_hourly_usd_source"] = meta.get("node_hourly_usd_source") or memorydb.get("node_hourly_usd_source") or ""
+    meta["node_hourly_usd_reason"] = meta.get("node_hourly_usd_reason") or memorydb.get("node_hourly_usd_reason") or ""
+    meta["node_count"] = meta.get("node_count") or memorydb.get("node_count") or ""
+    if memorydb:
+        # cluster_mode keeps its schema-v4 key and is always "true" on
+        # MemoryDB, which has no non-cluster mode. Only filled from MemoryDB
+        # details: a source-project run loaded for comparison keeps its own.
+        if not meta.get("cluster_mode"):
+            meta["cluster_mode"] = "true"
+        # Shard and replica counts are MemoryDB-only, so they live under the
+        # top-level "memorydb" key rather than in meta. None/"" checks, not
+        # `or`: 0 replicas per shard is a real topology, not a missing one.
+        memorydb_summary = summary.setdefault("memorydb", {})
+        for key in ("num_shards", "num_replicas_per_shard"):
+            if memorydb_summary.get(key) in (None, "") and memorydb.get(key) is not None:
+                memorydb_summary[key] = memorydb[key]
 
     # WP3 provenance. engine_version is the *configured* version (set above)
     # and is never overwritten here -- engine_version_actual is a separate
     # field because the two can legitimately differ ("7.1" vs "7.1.0").
-    meta["engine_version_actual"] = meta.get("engine_version_actual") or elasticache.get("engine_version_actual") or ""
+    meta["engine_version_actual"] = meta.get("engine_version_actual") or memorydb.get("engine_patch_version") or ""
     meta["git_sha"] = meta.get("git_sha") or run_info.get("git_sha") or ""
     meta["loadgen_image"] = meta.get("loadgen_image") or cluster_details.get("ecs", {}).get("loadgen_image") or ""
     if not meta.get("reporter_packages"):
@@ -394,19 +405,6 @@ def display_value(spec: MetricSpec, raw_value: Any) -> str:
         return str(raw_value)
     suffix = f" {spec.unit}" if spec.unit else ""
     return f"{format_number(numeric, spec.decimals)}{suffix}"
-
-
-def normalize_cluster_mode(value: Any) -> str | None:
-    if value in (None, ""):
-        return None
-    if isinstance(value, bool):
-        return "Cluster" if value else "Non-cluster"
-    lowered = str(value).strip().lower()
-    if lowered == "true":
-        return "Cluster"
-    if lowered == "false":
-        return "Non-cluster"
-    return str(value)
 
 
 def percent_change(a: float | None, b: float | None) -> str:

@@ -2,7 +2,7 @@
 
 Test 56 (acceptance: grouping by the full post-WP0 fingerprint must split
 today's high-CV groups) needs a real post-WP0 series and can't be produced
-from existing data (D10) -- see PLAN_2.md WP6 step 3.
+from existing data.
 """
 
 import sys
@@ -24,7 +24,12 @@ def _cluster_details(**overrides):
             "key_maximum_total": 100000, "test_time_seconds": 3600,
         },
         "ecs": {"fargate_cpu": 512, "fargate_memory": 1024},
-        "elasticache": {"cluster_mode_enabled": False, "num_cache_nodes": 1},
+        "memorydb": {
+            "num_shards": 1,
+            "num_replicas_per_shard": 1,
+            "tls_enabled": True,
+            "data_tiering": False,
+        },
     }
     for path, value in overrides.items():
         section, field = path.split(".")
@@ -239,16 +244,16 @@ class TotalOpsDedupTests(unittest.TestCase):
 
         def _row(metric_name, value, dimensions):
             return {
-                "Timestamp": "2026-08-10T00:00:00Z", "Namespace": "AWS/ElastiCache",
+                "Timestamp": "2026-08-10T00:00:00Z", "Namespace": "AWS/MemoryDB",
                 "MetricName": metric_name, "Stat": "Sum", "Value": value,
                 "Unit": "Count", "Dimensions": dimensions,
             }
 
         metrics_df = pd.DataFrame([
-            _row("GetTypeCmds", 1000, "CacheClusterId=cluster-a"),
-            _row("GetTypeCmds", 1000, "CacheClusterId=cluster-a;CacheNodeId=0001"),
-            _row("SetTypeCmds", 100, "CacheClusterId=cluster-a"),
-            _row("SetTypeCmds", 100, "CacheClusterId=cluster-a;CacheNodeId=0001"),
+            _row("GetTypeCmds", 1000, "ClusterName=cluster-a"),
+            _row("GetTypeCmds", 1000, "ClusterName=cluster-a;NodeName=cluster-a-0001-001"),
+            _row("SetTypeCmds", 100, "ClusterName=cluster-a"),
+            _row("SetTypeCmds", 100, "ClusterName=cluster-a;NodeName=cluster-a-0001-001"),
         ])
         metrics_df["Timestamp"] = pd.to_datetime(metrics_df["Timestamp"], utc=True).dt.tz_localize(None)
 

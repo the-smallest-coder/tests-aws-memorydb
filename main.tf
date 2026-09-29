@@ -1,8 +1,3 @@
-# =============================================================================
-# UNPORTED — copied verbatim from tests-aws-elasticache-redis @ HEAD.
-# This file still targets ElastiCache. See PLAN.md, work package WP1.
-# =============================================================================
-
 resource "time_static" "run_id" {}
 
 # Provenance of the git commit this `terraform apply` actually ran from.
@@ -16,12 +11,17 @@ data "external" "git_sha" {
 }
 
 locals {
-  # Auto-determine parameter group family if not specified
+  # MemoryDB parameter-group families are prefixed and use an underscore
+  # ("memorydb_valkey7"), while the *default parameter group* AWS ships for
+  # that family uses a hyphen ("default.memorydb-valkey7"). They are not the
+  # same string and are not interchangeable; WP0 step 2 confirms both against
+  # describe-parameter-groups.
   parameter_group_family = var.parameter_group_family != "" ? var.parameter_group_family : (
-    var.engine_type == "redis" ? "redis${split(".", var.engine_version)[0]}" : "valkey${split(".", var.engine_version)[0]}"
+    "memorydb_${var.engine_type}${split(".", var.engine_version)[0]}"
   )
+  default_parameter_group_name = "default.${replace(local.parameter_group_family, "_", "-")}"
 
-  # Compact run timestamp and suffix keep IDs within ElastiCache length limits.
+  # Compact run timestamp and suffix keep IDs within MemoryDB length limits.
   run_id_full   = formatdate("YYYYMMDDHHmmss", time_static.run_id.rfc3339)
   run_id_suffix = substr(local.run_id_full, length(local.run_id_full) - 8, 8)
 
@@ -36,27 +36,21 @@ locals {
   # Cluster identifier (run-scoped)
   cluster_id = "${var.project_name}-${var.engine_type}-${local.run_id_suffix}${local.run_disc_suffix}"
 
+  # MemoryDB bills every node, replicas included, and defaults to one replica
+  # per shard. The node count that matters for cost and for per-node metric
+  # dimensions is therefore shards x (replicas + 1), never num_shards alone.
+  memorydb_node_count = var.num_shards * (var.num_replicas_per_shard + 1)
+
   # Common tags
   common_tags = {
-    Name        = local.cluster_id
-    Engine      = var.engine_type
-    ClusterMode = var.cluster_mode_enabled ? "enabled" : "disabled"
+    Name   = local.cluster_id
+    Engine = var.engine_type
+    Shards = tostring(var.num_shards)
   }
-
-  # AZ pinning only applies to the single-node, non-cluster-mode case (see
-  # preferred_cache_cluster_azs below); cluster mode and multi-node runs
-  # fall back to AWS's own placement. Shared with node_details.tf so
-  # cluster_details.json never records an AZ that was requested but not
-  # actually applied.
-  elasticache_pinned_az = (
-    var.cluster_mode_enabled || var.elasticache_availability_zone == "" || var.num_cache_nodes != 1
-    ? null
-    : var.elasticache_availability_zone
-  )
 }
 
-# Subnet group for ElastiCache
-resource "aws_elasticache_subnet_group" "main" {
+# Subnet group for MemoryDB
+resource "aws_memorydb_subnet_group" "main" {
   name       = "${local.cluster_id}-subnet-group"
   subnet_ids = var.subnet_ids
 
@@ -66,7 +60,7 @@ resource "aws_elasticache_subnet_group" "main" {
 }
 
 # Parameter group for custom settings
-resource "aws_elasticache_parameter_group" "main" {
+resource "aws_memorydb_parameter_group" "main" {
   count = length(var.parameter_group_settings) > 0 ? 1 : 0
 
   name   = "${local.cluster_id}-params"
@@ -89,20 +83,24 @@ resource "aws_elasticache_parameter_group" "main" {
   }
 }
 
-# CloudWatch Log Group
-resource "aws_cloudwatch_log_group" "elasticache" {
-  name              = "/aws/elasticache/${local.cluster_id}"
-  retention_in_days = var.cloudwatch_log_retention_days
-
-  tags = {
-    Name = "${local.cluster_id}-logs"
-  }
-}
-
-# ElastiCache Replication Group (supports both cluster and non-cluster modes)
-resource "aws_elasticache_replication_group" "main" {
-  replication_group_id = local.cluster_id
-  description          = "ElastiCache ${var.engine_type} cluster for performance testing"
+# MemoryDB cluster under test.
+#
+# Hand-rolled rather than built on terraform-aws-modules/memory-db/aws. Three
+# resources with no conditional topology is less surface than the module's
+# variable contract, the module adds an ACL/user layer this project does not
+# use (open-access is the benchmarking default), and a benchmark harness wants
+# every argument that shapes the result visible in one file rather than
+# resolved inside a dependency. The cost is that MemoryDB argument changes are
+# ours to track; that is accepted.
+#
+# Differences from the ElastiCache original, all forced by the service:
+#   - always sharded, so there is no non-cluster branch
+#   - always multi-AZ and always encrypted at rest, so no toggles
+#   - TLS defaults on and an ACL is mandatory
+#   - no log_delivery_configuration and no AZ placement argument
+resource "aws_memorydb_cluster" "main" {
+  name        = local.cluster_id
+  description = "MemoryDB ${var.engine_type} cluster for performance testing"
 
   # Engine configuration
   engine         = var.engine_type
@@ -110,57 +108,34 @@ resource "aws_elasticache_replication_group" "main" {
   port           = var.port
   node_type      = var.node_type
 
-  # Cluster mode configuration
-  num_cache_clusters = var.cluster_mode_enabled ? null : var.num_cache_nodes
-
-  # Cluster mode specific settings
-  num_node_groups         = var.cluster_mode_enabled ? var.num_node_groups : null
-  replicas_per_node_group = var.cluster_mode_enabled ? var.replicas_per_node_group : null
+  # Topology. MemoryDB has no non-cluster mode; a single shard is still a
+  # sharded cluster and clients still have to be cluster-aware.
+  num_shards             = var.num_shards
+  num_replicas_per_shard = var.num_replicas_per_shard
 
   # Parameter group
-  parameter_group_name = length(var.parameter_group_settings) > 0 ? aws_elasticache_parameter_group.main[0].name : "default.${local.parameter_group_family}"
+  parameter_group_name = length(var.parameter_group_settings) > 0 ? aws_memorydb_parameter_group.main[0].name : local.default_parameter_group_name
 
   # Network configuration
-  subnet_group_name  = aws_elasticache_subnet_group.main.name
-  security_group_ids = [aws_security_group.elasticache.id]
+  subnet_group_name  = aws_memorydb_subnet_group.main.name
+  security_group_ids = [aws_security_group.memorydb.id]
 
-  # Availability and failover
-  #
-  # Pin the cache cluster's AZ when requested so which ECS AZ ends up
-  # co-located with the cache node is reproducible across repeated runs of
-  # the same config, rather than left to AWS's per-apply placement (which
-  # can flip between runs and inject AZ-placement noise unrelated to the
-  # node type under test). One entry per cache cluster, so this only
-  # applies to the single-node, non-cluster-mode case; cluster mode and
-  # multi-node runs fall back to AWS's own placement.
-  preferred_cache_cluster_azs = local.elasticache_pinned_az == null ? null : [local.elasticache_pinned_az]
-  automatic_failover_enabled  = var.automatic_failover_enabled
-  multi_az_enabled            = var.automatic_failover_enabled
+  # Security. Encryption at rest is always on and has no argument; kms_key_arn
+  # only swaps the AWS-owned key for a customer-managed one. TLS defaults to
+  # true, which is why the load generator always passes --tls.
+  acl_name    = var.acl_name
+  tls_enabled = var.tls_enabled
+  kms_key_arn = var.kms_key_arn != "" ? var.kms_key_arn : null
 
-  # Security
-  at_rest_encryption_enabled = var.at_rest_encryption_enabled
-  transit_encryption_enabled = var.transit_encryption_enabled
-  auth_token                 = var.transit_encryption_enabled ? var.auth_token : null
+  # Data tiering is fixed at create time and only valid on r6gd nodes. It adds
+  # the Tier dimension to CloudWatch and the BytesReadFromDisk metric family,
+  # which the exporter contract branches on.
+  data_tiering = var.data_tiering
 
   # Backup and maintenance
   snapshot_retention_limit = var.snapshot_retention_limit
   snapshot_window          = var.snapshot_retention_limit > 0 ? var.snapshot_window : null
   maintenance_window       = var.maintenance_window
-
-  # CloudWatch Logs
-  log_delivery_configuration {
-    destination      = aws_cloudwatch_log_group.elasticache.name
-    destination_type = "cloudwatch-logs"
-    log_format       = "json"
-    log_type         = "slow-log"
-  }
-
-  log_delivery_configuration {
-    destination      = aws_cloudwatch_log_group.elasticache.name
-    destination_type = "cloudwatch-logs"
-    log_format       = "json"
-    log_type         = "engine-log"
-  }
 
   # Auto minor version upgrade
   auto_minor_version_upgrade = true
@@ -172,7 +147,7 @@ resource "aws_elasticache_replication_group" "main" {
 
     precondition {
       condition     = length(local.cluster_id) <= 40
-      error_message = "cluster_id '${local.cluster_id}' exceeds ElastiCache's 40-character replication-group-id limit. Shorten project_name or run_id_discriminator."
+      error_message = "cluster_id '${local.cluster_id}' exceeds MemoryDB's 40-character cluster-name limit. Shorten project_name or run_id_discriminator."
     }
 
     # local._node_memory_bytes[var.node_type] in ecs.tf raises a bare
@@ -183,6 +158,13 @@ resource "aws_elasticache_replication_group" "main" {
     precondition {
       condition     = contains(keys(local._node_memory_bytes), var.node_type)
       error_message = "node_type '${var.node_type}' is not in the supported catalog. Supported types: ${join(", ", sort(keys(local._node_memory_bytes)))}."
+    }
+
+    # Data tiering exists only on the r6gd family. Setting it on anything else
+    # is rejected by the API at create time, several minutes into an apply.
+    precondition {
+      condition     = !var.data_tiering || startswith(var.node_type, "db.r6gd.")
+      error_message = "data_tiering is only supported on db.r6gd.* node types; node_type is '${var.node_type}'."
     }
   }
 }

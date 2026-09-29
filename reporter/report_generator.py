@@ -20,13 +20,15 @@ from parsers import (
 )
 from summary import build_summary
 from cards import header_pills, loadgen_quality_html, stat_cards_html
-from charts import build_memtier_figure, build_infra_panels, build_elasticache_deep_dive_figure
+from charts import build_memtier_figure, build_infra_panels, build_memorydb_deep_dive_figure
 from template import render_html
+
+import metric_source
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Generate ElastiCache reports. No args uses ECS env vars; local comparison uses the compare command.",
+        description="Generate MemoryDB reports. No args uses ECS env vars; local comparison uses the compare command.",
     )
     subparsers = parser.add_subparsers(dest="command")
     compare = subparsers.add_parser("compare", help="Compare two results_<run>.json runs.")
@@ -46,13 +48,14 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--engine-version", default="", help="e.g. 7.1")
     generate.add_argument("--node-type", default="", help="e.g. cache.t4g.micro")
     generate.add_argument("--node-count", default="", help="e.g. 1")
-    generate.add_argument("--cluster-mode", default="false", help="true or false")
+    generate.add_argument("--num-shards", default="", help="Shard count for this run")
+    generate.add_argument("--num-replicas-per-shard", default="", help="Replicas per shard for this run")
     generate.add_argument(
         "--output-dir",
         default=None,
         help="Write results_local.{html,json} here instead of run_dir. Default is run_dir "
         "itself, for backward compatibility; pass this against a real results/<run-folder>/ "
-        "you want to keep read-only (D9) -- e.g. a copy made for verification, per PLAN_2.md, "
+        "you want to keep read-only -- e.g. a copy made for verification, "
         "already gets this for free since the copy isn't the tracked run.",
     )
     inspect = subparsers.add_parser("inspect", help="Inspect local run readiness and legacy warnings.")
@@ -169,7 +172,8 @@ def _config_from_env() -> dict[str, str]:
         "node_hourly_usd_source": os.environ.get("NODE_HOURLY_USD_SOURCE", ""),
         "node_hourly_usd_reason": os.environ.get("NODE_HOURLY_USD_REASON", ""),
         "node_count": os.environ.get("NODE_COUNT", ""),
-        "cluster_mode": os.environ.get("CLUSTER_MODE", "false"),
+        "num_shards": os.environ.get("NUM_SHARDS", ""),
+        "num_replicas_per_shard": os.environ.get("NUM_REPLICAS_PER_SHARD", ""),
         # WP3 provenance. git_sha/engine_version_actual/loadgen_image are
         # apply-time facts that normally arrive via cluster_details.json
         # instead (env has no equivalent var for them); reporter_packages is
@@ -180,28 +184,41 @@ def _config_from_env() -> dict[str, str]:
 
 
 def _config_from_cluster_details(cluster_details: dict) -> dict[str, str]:
-    elasticache = cluster_details.get("elasticache", {}) if cluster_details else {}
+    memorydb = cluster_details.get("memorydb", {}) if cluster_details else {}
     run_info = cluster_details.get("run", {}) if cluster_details else {}
     ecs_info = cluster_details.get("ecs", {}) if cluster_details else {}
     memtier = cluster_details.get("memtier", {}) if cluster_details else {}
     # Terraform's jsonencode emits explicit JSON null for fields that don't
-    # apply to this topology (e.g. num_cache_nodes under cluster mode), which
+    # apply to this topology, which
     # json.loads turns into None. Normalize to "" so _merge_missing_config's
     # "missing means falsy" check treats them the same as an absent field.
+    # placement.availability_zones is every AZ any node landed in -- replicas
+    # included, sorted -- because MemoryDB has no AZ argument to request one.
+    # It names "the" cluster AZ only when there is exactly one entry. MemoryDB
+    # spreads replicas across AZs, and the Terraform shards attribute does not
+    # say which node is the primary that serves memtier's traffic, so with
+    # more than one AZ the value is left unset and loadgen_analysis infers it
+    # from task latency instead. Taking [0] would present the alphabetically
+    # first AZ -- possibly a replica's -- as measured.
+    placement_azs = (cluster_details.get("placement") or {}).get("availability_zones") or []
+
     raw = {
-        "engine_type": elasticache.get("engine"),
-        "engine_version": elasticache.get("engine_version_configured"),
-        "node_type": elasticache.get("node_type"),
-        "node_memory_bytes": elasticache.get("node_memory_bytes"),
-        "node_hourly_usd": elasticache.get("node_hourly_usd"),
-        "node_hourly_usd_source": elasticache.get("node_hourly_usd_source"),
-        "node_hourly_usd_reason": elasticache.get("node_hourly_usd_reason"),
-        "elasticache_availability_zone": elasticache.get("availability_zone"),
-        "node_count": elasticache.get("num_cache_nodes"),
-        "cluster_mode": elasticache.get("cluster_mode_enabled"),
-        # WP3 provenance (D-none; PLAN_2.md WP3). engine_version_configured
+        "engine_type": memorydb.get("engine"),
+        "engine_version": memorydb.get("engine_version_configured"),
+        "node_type": memorydb.get("node_type"),
+        "node_memory_bytes": memorydb.get("node_memory_bytes"),
+        "node_hourly_usd": memorydb.get("node_hourly_usd"),
+        "node_hourly_usd_source": memorydb.get("node_hourly_usd_source"),
+        "node_hourly_usd_reason": memorydb.get("node_hourly_usd_reason"),
+        # Key spelling kept for schema-v4 consumers; the value is now an
+        # observed AZ rather than a requested one.
+        "elasticache_availability_zone": placement_azs[0] if len(placement_azs) == 1 else None,
+        "node_count": memorydb.get("node_count"),
+        "num_shards": memorydb.get("num_shards"),
+        "num_replicas_per_shard": memorydb.get("num_replicas_per_shard"),
+        # Run provenance. engine_version_configured
         # above stays what was *requested*; this is what actually came up.
-        "engine_version_actual": elasticache.get("engine_version_actual"),
+        "engine_version_actual": memorydb.get("engine_patch_version"),
         "git_sha": run_info.get("git_sha"),
         "loadgen_image": ecs_info.get("loadgen_image"),
         # cluster_details.json never carries this -- it's apply-time, pip
@@ -224,36 +241,46 @@ def _merge_missing_config(config: dict | None, extra_config: dict | None) -> dic
     return merged
 
 
-def _warn_if_cache_hit_rate_missing(metrics_df, source: str) -> None:
+def _warn_if_keyspace_hit_rate_underivable(metrics_df, source: str) -> None:
+    """Warn when hit rate cannot be derived.
+
+    The ElastiCache version first looked for a published CacheHitRate and
+    only warned if the fallback inputs were also absent. MemoryDB publishes
+    no hit-rate metric at all, so there is no direct path to miss -- the only
+    question is whether KeyspaceHits and KeyspaceMisses are both present.
+    """
     if metrics_df.empty:
         return
-    hit_rate = metrics_df[
-        (metrics_df["MetricName"] == "CacheHitRate")
-        & (metrics_df["Stat"] == "Average")
-        & (metrics_df["Dimensions"].astype(str).str.startswith("CacheClusterId"))
-    ]
-    if hit_rate.empty:
-        has_hits = (
-            (metrics_df["MetricName"] == "CacheHits")
+
+    dimensions = metrics_df["Dimensions"].astype(str)
+    have = {}
+    for label, name in (
+        ("hits", metric_source.KEYSPACE_HITS),
+        ("misses", metric_source.KEYSPACE_MISSES),
+    ):
+        have[label] = (
+            (metrics_df["MetricName"] == name)
             & (metrics_df["Stat"] == "Sum")
-            & (metrics_df["Dimensions"].astype(str).str.startswith("CacheClusterId"))
+            & dimensions.str.startswith(metric_source.CLUSTER_DIMENSION)
         ).any()
-        has_misses = (
-            (metrics_df["MetricName"] == "CacheMisses")
-            & (metrics_df["Stat"] == "Sum")
-            & (metrics_df["Dimensions"].astype(str).str.startswith("CacheClusterId"))
-        ).any()
-        if has_hits and has_misses:
-            print(
-                "Info: CacheHitRate/Average is missing from "
-                f"{source}; deriving hit rate from CacheHits/CacheMisses."
-            )
-            return
-        print(
-            "Warning: CacheHitRate/Average with CacheClusterId dimensions is missing from "
-            f"{source}. The old local report plotted this CloudWatch metric directly, "
-            "so the cache-hit chart cannot be reproduced until those metrics are present."
+
+    if have["hits"] and have["misses"]:
+        return
+
+    absent = [
+        name
+        for label, name in (
+            ("hits", metric_source.KEYSPACE_HITS),
+            ("misses", metric_source.KEYSPACE_MISSES),
         )
+        if not have[label]
+    ]
+    print(
+        f"Warning: {'/'.join(absent)} missing at the "
+        f"{metric_source.CLUSTER_DIMENSION} dimension in {source}. "
+        "MemoryDB publishes no hit-rate metric directly, so hit rate is "
+        "derived from these two and cannot be reported without them."
+    )
 
 
 def _s3_bucket_key(uri: str) -> tuple[str, str]:
@@ -695,9 +722,9 @@ def create_report(
 ) -> tuple[str, str]:
     """Build the rich HTML report and matching summary JSON.
 
-    This follows the March 2026 local report pipeline. Cache hit rate is read
-    from CacheHitRate/Average when CloudWatch publishes it, or derived from
-    CacheHits/CacheMisses at CacheClusterId granularity when it does not.
+    This follows the March 2026 local report pipeline. Keyspace hit rate is
+    always derived from KeyspaceHits/KeyspaceMisses at the ClusterName
+    dimension -- MemoryDB publishes no hit-rate metric of its own.
     """
     import pandas as pd
 
@@ -714,8 +741,9 @@ def create_report(
 
     fig_m = build_memtier_figure(memtier_minute_df, oom_df, metrics_window_df, x_min, x_max)
     time_range = _format_time_range(x_min, x_max)
-    cluster_mode = str(config.get("cluster_mode", "false")).lower() == "true"
-    id_label = "Cluster" if cluster_mode else "Replication Group"
+    # Always "Cluster": MemoryDB has no non-cluster mode, so there is no
+    # second label to switch to.
+    id_label = "Cluster"
 
     summary = build_summary(
         metrics_window_df,
@@ -745,10 +773,10 @@ def create_report(
         x_max,
         task_az_map=_task_az_map(extra_stats.get("container_insights_task_df")),
         task_index_by_id=task_index_by_id,
-        elasticache_az=loadgen.get("elasticache_availability_zone"),
-        elasticache_az_source=loadgen.get("elasticache_availability_zone_source"),
+        memorydb_az=loadgen.get("elasticache_availability_zone"),
+        memorydb_az_source=loadgen.get("elasticache_availability_zone_source"),
     )
-    fig_d = build_elasticache_deep_dive_figure(metrics_window_df, cluster_id, config, x_min, x_max)
+    fig_d = build_memorydb_deep_dive_figure(metrics_window_df, cluster_id, config, x_min, x_max)
     summary_json = json.dumps(summary, indent=2, default=str)
 
     html_content = render_html(
@@ -828,7 +856,7 @@ def run_generate_report(run_dir: str, config: dict, output_dir: str | None = Non
     else:
         memtier_minute_df, memtier_totals_df = _memtier_dfs_from_log_entries(log_entries)
 
-    _warn_if_cache_hit_rate_missing(metrics_df, str(ec_csvs[0]))
+    _warn_if_keyspace_hit_rate_underivable(metrics_df, str(ec_csvs[0]))
 
     cluster_details_path = run_path / "cluster_details.json"
     cluster_details = None
@@ -862,7 +890,7 @@ def run_generate_report(run_dir: str, config: dict, output_dir: str | None = Non
 
     # Local regeneration must never replace the canonical report downloaded
     # from AWS for this immutable run. Writes into run_path itself by
-    # default (backward compatible with existing callers and PLAN_2.md's own
+    # default (backward compatible with existing callers and the source project's own
     # verification recipe, which runs this against a throwaway copy) -- D9
     # read-only-run-dir only holds when the caller passes --output-dir.
     out_path = out_dir / "results_local.json"
@@ -912,7 +940,7 @@ def run_uploaded_report() -> dict:
 
     print(f"Reading metrics from {metrics_csv}")
     metrics_df = parse_metrics_csv(read_file_content(metrics_csv))
-    _warn_if_cache_hit_rate_missing(metrics_df, metrics_csv)
+    _warn_if_keyspace_hit_rate_underivable(metrics_df, metrics_csv)
 
     log_entries = _read_uploaded_log_contents(logs_prefix)
     if not log_entries:
@@ -966,7 +994,7 @@ def run_uploaded_report() -> dict:
         cluster_details_status = {"present": True}
     except Exception as exc:
         # cluster_details.json is written once, at apply time, by
-        # node_details.tf (PLAN_2.md WP0). A live run always produces it, so
+        # node_details.tf. A live run always produces it, so
         # its absence here means a failed upload or a broken apply, not an
         # optional artifact. The gap must stay visible, not fall back to
         # env-only config in silence.
@@ -1032,7 +1060,8 @@ def main() -> None:
             "engine_version": args.engine_version,
             "node_type": args.node_type,
             "node_count": args.node_count,
-            "cluster_mode": args.cluster_mode,
+            "num_shards": args.num_shards,
+            "num_replicas_per_shard": args.num_replicas_per_shard,
         }
         run_generate_report(args.run_dir, config, output_dir=args.output_dir)
         return

@@ -1,8 +1,3 @@
-# =============================================================================
-# UNPORTED — copied verbatim from tests-aws-elasticache-redis @ HEAD.
-# This file still targets ElastiCache. See PLAN.md, work package WP1.
-# =============================================================================
-
 variable "aws_region" {
   description = "AWS region for resources"
   type        = string
@@ -12,32 +7,32 @@ variable "aws_region" {
 variable "project_name" {
   description = "Project name for resource naming and tagging"
   type        = string
-  default     = "elasticache-perf-test"
+  default     = "memorydb-perf-test"
 }
 
 
 # VPC and Networking
 variable "vpc_id" {
-  description = "ID of existing VPC where ElastiCache will be deployed"
+  description = "ID of existing VPC where MemoryDB will be deployed"
   type        = string
 }
 
 variable "subnet_ids" {
-  description = "List of subnet IDs for ElastiCache subnet group"
+  description = "List of subnet IDs for the MemoryDB subnet group"
   type        = list(string)
 }
 
 variable "allowed_cidr_blocks" {
-  description = "CIDR blocks allowed to connect to ElastiCache (defaults to VPC CIDR if empty)"
+  description = "CIDR blocks allowed to connect to MemoryDB (defaults to VPC CIDR if empty)"
   type        = list(string)
   default     = []
 }
 
-# ElastiCache Configuration
+# MemoryDB Configuration
 variable "engine_type" {
-  description = "Cache engine type: redis or valkey"
+  description = "Engine: redis or valkey. Defaults to valkey because the server-side latency metrics this project reports (SuccessfulReadRequestLatency, SuccessfulWriteRequestLatency) require Valkey 7.2+ and do not exist on Redis OSS."
   type        = string
-  default     = "redis"
+  default     = "valkey"
 
   validation {
     condition     = contains(["redis", "valkey"], var.engine_type)
@@ -46,20 +41,20 @@ variable "engine_type" {
 }
 
 variable "engine_version" {
-  description = "Engine version (e.g., 7.1 for Redis, 7.2 for Valkey)"
+  description = "Engine version (e.g., 7.2 for Valkey). Below 7.2 the server-side latency metrics are absent."
   type        = string
-  default     = "7.1"
+  default     = "7.2"
 }
 
 variable "node_type" {
-  description = "ElastiCache node instance type"
+  description = "MemoryDB node instance type (db.*). There is no db.t4g.micro; db.t4g.small is the smallest MemoryDB offers."
   type        = string
-  default     = "cache.t4g.micro"
+  default     = "db.t4g.small"
 }
 
 variable "enable_price_lookup" {
   description = <<-EOT
-    Look up this run's live hourly node price via scripts/fetch_elasticache_price.sh
+    Look up this run's live hourly node price via scripts/fetch_memorydb_price.sh
     (requires bash, aws, and jq on whatever machine runs Terraform). The script itself
     always exits 0, but Terraform launching it at all can still fail the plan if bash
     isn't on PATH -- that's a `data` block, so it's re-evaluated on every plan,
@@ -71,56 +66,66 @@ variable "enable_price_lookup" {
   default     = true
 }
 
-variable "cluster_mode_enabled" {
-  description = "Enable Redis/Valkey cluster mode (sharding)"
-  type        = bool
-  default     = false
-}
-
-# Non-cluster mode settings
-variable "num_cache_nodes" {
-  description = "Number of cache nodes for non-cluster mode (including primary)"
+# Topology. MemoryDB is always sharded -- one shard is still a cluster.
+variable "num_shards" {
+  description = "Number of shards. MemoryDB has no non-cluster mode, so this is always at least 1."
   type        = number
   default     = 1
 
   validation {
-    condition     = var.num_cache_nodes >= 1 && var.num_cache_nodes <= 6
-    error_message = "Number of cache nodes must be between 1 and 6."
+    condition     = var.num_shards >= 1 && var.num_shards <= 500
+    error_message = "Number of shards must be between 1 and 500."
   }
 }
 
-variable "elasticache_availability_zone" {
-  description = "Pin the ElastiCache node to a specific AZ. Empty = let AWS choose. Must be one of the subnet group's AZs."
-  type        = string
-  default     = ""
-}
-
-# Cluster mode settings
-variable "num_node_groups" {
-  description = "Number of node groups (shards) for cluster mode"
-  type        = number
-  default     = 1
-
-  validation {
-    condition     = var.num_node_groups >= 1 && var.num_node_groups <= 500
-    error_message = "Number of node groups must be between 1 and 500."
-  }
-}
-
-variable "replicas_per_node_group" {
-  description = "Number of replica nodes per shard in cluster mode"
+variable "num_replicas_per_shard" {
+  description = <<-EOT
+    Replicas per shard. 0 -- a single-node cluster -- so runs stay comparable
+    with the single-node ElastiCache runs this project is measured against.
+    This deliberately overrides MemoryDB's own API default of 1. Durability
+    does not depend on it: MemoryDB commits writes to its multi-AZ
+    transaction log either way. Nodes billed = num_shards x
+    (num_replicas_per_shard + 1). With 0, the replication metrics
+    (ReplicationLag, ReplicationBytes, MaxReplicationThroughput,
+    ReplicationDelayedWriteCommands) have nothing to report, and the export
+    contract does not require them.
+  EOT
   type        = number
   default     = 0
 
   validation {
-    condition     = var.replicas_per_node_group >= 0 && var.replicas_per_node_group <= 5
-    error_message = "Replicas per node group must be between 0 and 5."
+    condition     = var.num_replicas_per_shard >= 0 && var.num_replicas_per_shard <= 5
+    error_message = "Replicas per shard must be between 0 and 5."
   }
+}
+
+variable "acl_name" {
+  description = "MemoryDB ACL to attach. Every cluster must name one; open-access is the immutable account-wide ACL used for benchmarking, and is mandatory when tls_enabled is false."
+  type        = string
+  default     = "open-access"
+}
+
+variable "tls_enabled" {
+  description = "Encryption in transit. MemoryDB defaults this to true; the load generator passes --tls to match. Disabling it forces acl_name to open-access."
+  type        = bool
+  default     = true
+}
+
+variable "kms_key_arn" {
+  description = "Customer-managed KMS key for encryption at rest. Empty uses the AWS-owned key. Encryption at rest itself is always on and cannot be disabled."
+  type        = string
+  default     = ""
+}
+
+variable "data_tiering" {
+  description = "Enable data tiering (SSD-backed). Only valid on db.r6gd.* node types, fixed at create time, and adds the Tier dimension plus the disk metric family to CloudWatch."
+  type        = bool
+  default     = false
 }
 
 # Performance and Configuration
 variable "port" {
-  description = "Port number for ElastiCache"
+  description = "Port number for MemoryDB"
   type        = number
   default     = 6379
 }
@@ -153,31 +158,6 @@ variable "maintenance_window" {
   description = "Weekly time range for maintenance (ddd:HH:MM-ddd:HH:MM in UTC)"
   type        = string
   default     = "sun:05:00-sun:07:00"
-}
-
-variable "automatic_failover_enabled" {
-  description = "Enable automatic failover (requires multi-node setup)"
-  type        = bool
-  default     = false
-}
-
-variable "at_rest_encryption_enabled" {
-  description = "Enable encryption at rest"
-  type        = bool
-  default     = false
-}
-
-variable "transit_encryption_enabled" {
-  description = "Enable encryption in transit (TLS)"
-  type        = bool
-  default     = false
-}
-
-variable "auth_token" {
-  description = "Auth token for Redis AUTH (requires transit_encryption_enabled)"
-  type        = string
-  default     = null
-  sensitive   = true
 }
 
 # CloudWatch
@@ -225,27 +205,17 @@ variable "loadgen_task_count" {
 }
 
 variable "loadgen_image" {
-  description = "memtier_benchmark container image, pinned to a digest so a tag push upstream can't silently change what's under test between two runs."
+  description = "memtier_benchmark container image. The one pinned dependency in this project: MemoryDB results are compared against the ElastiCache repo (tests-aws-elasticache-redis), so both must measure with the same memtier build. Keep this digest identical to that repo's loadgen_image default and bump both together (tests/test_reporter_dependencies.py compares them when the sibling repo is checked out)."
   type        = string
-  # Manifest-list (multi-arch) digest, not an arch-specific one: neither this
-  # task definition nor ecs.tf sets a runtime_platform block, so Fargate
-  # picks the platform itself -- an arch-specific pin would lock that choice
-  # silently. Re-fetch when a bump is deliberate:
-  #   TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:redislabs/memtier_benchmark:pull" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
-  #   curl -sI -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json" https://registry-1.docker.io/v2/redislabs/memtier_benchmark/manifests/latest | grep -i docker-content-digest
-  # Fetched 2026-09-07 (was redislabs/memtier_benchmark:latest, unpinned).
+  # Manifest-list (multi-arch) digest, as in the ElastiCache repo, fetched
+  # there 2026-09-07 from redislabs/memtier_benchmark:latest.
   default = "redislabs/memtier_benchmark@sha256:5f15b74f657fd30ee73453af9caa1781de1614f4d934d46feee711dc19b758af"
 }
 
 variable "reporter_image" {
-  description = "Base image for the reporter ECS task, pinned to a digest for the same reason as loadgen_image. Kept in sync with reporter/Dockerfile's FROM line (tests/test_reporter_dependency_pins.py checks it), which isn't actually used by this task definition today but should track the same base."
+  description = "Base image for the reporter ECS task. Deliberately a floating tag (newest Python): it only renders reports and does not affect what is measured. Kept the same as reporter/Dockerfile's FROM line (tests/test_reporter_dependencies.py checks it), which this task definition does not use today but should track the same base."
   type        = string
-  # Same manifest-list caveat as loadgen_image above. Re-fetch when a bump is
-  # deliberate:
-  #   TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/python:pull" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
-  #   curl -sI -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json" https://registry-1.docker.io/v2/library/python/manifests/3.11-slim | grep -i docker-content-digest
-  # Fetched 2026-09-07 (was python:3.11-slim, unpinned).
-  default = "python@sha256:9534e5a8e315485d4061ed659af0fd78a284c015f9b73661b41d6bab25604534"
+  default     = "python:slim"
 }
 
 variable "loadgen_cpu" {

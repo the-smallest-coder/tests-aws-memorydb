@@ -167,7 +167,7 @@ class DownloadResultsLogicTests(unittest.TestCase):
                     {
                       "aws_region": {"value": "us-east-1"},
                       "metrics_export_location": {"value": "s3://bucket/exports/"},
-                      "elasticache_cluster_id": {"value": "cluster-current"},
+                      "memorydb_cluster_name": {"value": "cluster-current"},
                       "loadgen_cluster_name": {"value": "ecs-cluster"},
                       "loadgen_service_name": {"value": "loadgen-service"},
                       "loadgen_log_group_name": {"value": "/aws/ecs/current"},
@@ -204,7 +204,7 @@ class DownloadResultsLogicTests(unittest.TestCase):
                                 exit 2
                                 ;;
                         esac
-                    elif [[ "$1" == "elasticache" && "$2" == "describe-replication-groups" ]]; then
+                    elif [[ "$1" == "memorydb" && "$2" == "describe-clusters" ]]; then
                         printf 'available\\n'
                     elif [[ "$1" == "ecs" && "$2" == "describe-services" ]]; then
                         printf '{"desiredCount":0,"runningCount":0,"pendingCount":0}\\n'
@@ -264,7 +264,7 @@ class DownloadResultsLogicTests(unittest.TestCase):
                     {
                       "aws_region": {"value": "us-east-1"},
                       "metrics_export_location": {"value": "s3://bucket/exports/"},
-                      "elasticache_cluster_id": {"value": "cluster-current"},
+                      "memorydb_cluster_name": {"value": "cluster-current"},
                       "loadgen_cluster_name": {"value": "ecs-cluster"},
                       "loadgen_service_name": {"value": "loadgen-service"},
                       "loadgen_log_group_name": {"value": "/aws/ecs/current"},

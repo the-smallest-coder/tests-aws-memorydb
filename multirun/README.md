@@ -1,7 +1,3 @@
-> **Inherited.** The multirun workspace helper is copied unchanged and still drives the
-> ElastiCache root config. It should keep working once WP1 lands, but nothing verifies
-> that yet.
-
 # Multirun helper
 
 `multirun.sh` runs disposable ElastiCache performance tests from the existing
